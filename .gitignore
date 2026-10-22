@@ -1,0 +1,10 @@
+__pycache__/
+*.py[cod]
+config.json
+*.log
+.venv/
+venv/
+.pytest_cache/
+docs/*.png
+docs/*.jpg
+screenshots/

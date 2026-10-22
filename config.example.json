@@ -1,0 +1,62 @@
+{
+  "poll_hz": 125,
+  "toggle_key": "F8",
+  "start_enabled": true,
+  "deadzone": 0.15,
+  "target_window": "",
+  "target_process": "douyin.exe",
+  "log_level": "info",
+  "restore_cursor": true,
+  "ensure_foreground": true,
+  "stick": {
+    "threshold": 0.6,
+    "release": 0.35,
+    "repeat_ms": 450,
+    "up_action": "swipe_up",
+    "down_action": "swipe_down"
+  },
+  "mouse": {
+    "deadzone": 0.15,
+    "max_speed_px_s": 900.0,
+    "curve": 2.0,
+    "invert_y": true
+  },
+  "trigger": {
+    "threshold": 0.5,
+    "release": 0.35,
+    "cooldown_ms": 200
+  },
+  "tap": {
+    "window_ms": 350
+  },
+  "swipe": {
+    "method": "wheel",
+    "notches": 1,
+    "key_up": "up",
+    "key_down": "down"
+  },
+  "like": {
+    "method": "double_click",
+    "key": "",
+    "x": 0.5,
+    "y": 0.45
+  },
+  "back": {
+    "method": "key",
+    "key": "esc|alt+left",
+    "x": 0.5,
+    "y": 0.5
+  },
+  "favorite": {
+    "method": "click",
+    "key": "",
+    "x": 0.9685,
+    "y": 0.6753
+  },
+  "comments": {
+    "method": "click",
+    "key": "",
+    "x": 0.9685,
+    "y": 0.5922
+  }
+}
