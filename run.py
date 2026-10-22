@@ -28,6 +28,8 @@ ACTION_METHOD = {
     "comments": "open_comments",
     "swipe_up": "swipe_up",
     "swipe_down": "swipe_down",
+    "seek_forward": "seek_forward",
+    "seek_backward": "seek_backward",
 }
 
 ACTION_NAMES = tuple(ACTION_METHOD.keys())

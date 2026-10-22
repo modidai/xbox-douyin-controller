@@ -1,6 +1,7 @@
 """app 引擎离线测试：不碰真实手柄、不碰真实输入。"""
 from __future__ import annotations
 
+import ctypes
 import os
 import sys
 
@@ -9,7 +10,7 @@ if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
 from xbox_douyin.app import App, NullActions, normalize_config
-from xbox_douyin.config import Config, MouseConfig, StickConfig
+from xbox_douyin.config import Config, HoldConfig, MouseConfig, StickConfig
 from xbox_douyin.injector import (
     INPUT_KEYBOARD,
     INPUT_MOUSE,
@@ -23,7 +24,15 @@ from xbox_douyin.injector import (
     Injector,
     key_is_down,
 )
-from xbox_douyin.xinput import BUTTON_A, BUTTON_B, BUTTON_X, BUTTON_Y, PadState
+from xbox_douyin.xinput import (
+    BUTTON_A,
+    BUTTON_B,
+    BUTTON_LEFT_SHOULDER,
+    BUTTON_RIGHT_SHOULDER,
+    BUTTON_X,
+    BUTTON_Y,
+    PadState,
+)
 
 FAILED = []
 COUNT = [0]
@@ -64,6 +73,15 @@ class FakeActions(object):
     def open_comments(self):
         self.calls.append("open_comments")
 
+    def seek_forward(self):
+        self.calls.append("seek_forward")
+
+    def seek_backward(self):
+        self.calls.append("seek_backward")
+
+    def set_speed(self, label):
+        self.calls.append("set_speed:%s" % label)
+
 
 def quiet_app(cfg=None, actions=None, **kwargs):
     return App(cfg or Config(), actions or FakeActions(), out=None, **kwargs)
@@ -73,7 +91,22 @@ def test_selftest_sequence():
     actions = FakeActions()
     app = App(Config(), actions, injector=None, out=None)
     sequence = app.run_selftest()
-    head = ["swipe_up", "swipe_up", "swipe_down", "like", "back", "favorite", "open_comments", "mouse_move", "click"]
+    head = [
+        "swipe_up",
+        "swipe_up",
+        "swipe_down",
+        "like",
+        "back",
+        "favorite",
+        "open_comments",
+        "seek_backward",
+        "set_speed:2x",
+        "set_speed:1x",
+        "set_speed:0.75x",
+        "set_speed:1x",
+        "mouse_move",
+        "click",
+    ]
     check("自检：动作序列前半段符合预期", sequence[: len(head)] == head, sequence)
 
     check("自检：序列里有停用/启用标记", "toggle_off" in sequence and "toggle_on" in sequence, sequence)
@@ -656,6 +689,410 @@ def test_cmd_action_exit_codes():
         douyin_module.DouyinActions = original
 
 
+def _rb_seek_cfg():
+    """RB 默认 short_action="none"（用户决定留空），验证 seek 路径时显式配成 seek_forward。"""
+    cfg = Config()
+    cfg.rb = HoldConfig(long_ms=400, short_action="seek_forward", hold_speed="2x", restore_speed="1x")
+    return cfg
+
+
+def _shoulder_app(cfg=None, actions=None):
+    actions = actions if actions is not None else FakeActions()
+    app = App(cfg or Config(), actions, injector=None, out=None)
+    return app, actions
+
+
+def test_shoulder_short_press():
+    cfg = _rb_seek_cfg()
+    app, actions = _shoulder_app(cfg)
+    long_s = cfg.rb.long_ms / 1000.0
+    check("肩键：按下当帧不发任何动作", app.step(PadState(buttons=BUTTON_RIGHT_SHOULDER), now=0.0) == [])
+    check(
+        "肩键：按住但未到阈值也不发动作",
+        app.step(PadState(buttons=BUTTON_RIGHT_SHOULDER), now=long_s / 2) == [],
+    )
+    fired = app.step(PadState(), now=long_s / 2 + 0.01)
+    check("肩键：短按在松开时才发 seek_forward", fired == ["seek_forward"], fired)
+    check("肩键：动作层确实只收到 seek_forward", actions.calls == ["seek_forward"], actions.calls)
+
+
+def test_shoulder_long_press():
+    cfg = Config()
+    long_s = cfg.rb.long_ms / 1000.0
+    app, actions = _shoulder_app(cfg)
+    app.step(PadState(buttons=BUTTON_RIGHT_SHOULDER), now=0.0)
+    fired = app.step(PadState(buttons=BUTTON_RIGHT_SHOULDER), now=long_s + 0.1)
+    check("肩键：长按到阈值切 2x", fired == ["set_speed:2x"], fired)
+    fired2 = app.step(PadState(), now=long_s + 0.2)
+    check("肩键：长按松开只恢复 1x", fired2 == ["set_speed:1x"], fired2)
+    check("肩键：长按全程不发 seek", actions.calls == ["set_speed:2x", "set_speed:1x"], actions.calls)
+
+
+def test_shoulder_hold_fires_once():
+    cfg = Config()
+    app, actions = _shoulder_app(cfg)
+    app.step(PadState(buttons=BUTTON_RIGHT_SHOULDER), now=0.0)
+    fired = []
+    for step in range(1, 30):
+        fired.extend(app.step(PadState(buttons=BUTTON_RIGHT_SHOULDER), now=step * 0.02))
+    check("肩键：按住 30 帧 set_speed 只发一次", fired.count("set_speed:2x") == 1, fired)
+    check("肩键：按住期间没有任何 seek", "seek_forward" not in actions.calls, actions.calls)
+
+
+def test_shoulder_lb_mirrors_rb():
+    cfg = Config()
+    long_s = cfg.lb.long_ms / 1000.0
+    app, actions = _shoulder_app(cfg)
+    app.step(PadState(buttons=BUTTON_LEFT_SHOULDER), now=0.0)
+    fired = app.step(PadState(), now=long_s / 2)
+    check("肩键：LB 短按发 seek_backward", fired == ["seek_backward"], fired)
+
+    app2, actions2 = _shoulder_app(cfg)
+    app2.step(PadState(buttons=BUTTON_LEFT_SHOULDER), now=0.0)
+    fired2 = app2.step(PadState(buttons=BUTTON_LEFT_SHOULDER), now=long_s + 0.1)
+    check("肩键：LB 长按切 0.75x 慢速", fired2 == ["set_speed:0.75x"], fired2)
+    fired3 = app2.step(PadState(), now=long_s + 0.2)
+    check("肩键：LB 松开恢复 1x", fired3 == ["set_speed:1x"], fired3)
+    check("肩键：LB 长按全程不发 seek_backward", actions2.calls == ["set_speed:0.75x", "set_speed:1x"], actions2.calls)
+
+
+def test_shoulder_short_action_none():
+    cfg = Config()
+    cfg.rb = HoldConfig(long_ms=400, short_action="none", hold_speed="2x", restore_speed="1x")
+    app, actions = _shoulder_app(cfg)
+    app.step(PadState(buttons=BUTTON_RIGHT_SHOULDER), now=0.0)
+    fired = app.step(PadState(), now=0.05)
+    check("肩键：short_action=none 时短按什么也不发", fired == [] and actions.calls == [], (fired, actions.calls))
+
+
+def test_shoulder_disabled():
+    cfg = Config()
+    app, actions = _shoulder_app(cfg)
+    app.step(PadState(), now=0.0, toggle=True)
+    check("肩键：停用后按下不响应", app.step(PadState(buttons=BUTTON_RIGHT_SHOULDER), now=0.05) == [])
+    check("肩键：停用期间长按也不切倍速", app.step(PadState(buttons=BUTTON_RIGHT_SHOULDER), now=0.6) == [])
+    check("肩键：停用期间松手不补发 seek", app.step(PadState(), now=0.7) == [])
+    check("肩键：停用期间肩键全程零动作", actions.calls == [], actions.calls)
+
+    # 启用时按下 -> 中途停用 -> 松手不应补发
+    app2, actions2 = _shoulder_app(cfg)
+    app2.step(PadState(buttons=BUTTON_RIGHT_SHOULDER), now=0.0)
+    app2.step(PadState(), now=0.1, toggle=True)
+    fired2 = app2.step(PadState(), now=0.2)
+    check("肩键：按下后中途停用，松手静默丢弃", fired2 == [] and actions2.calls == [], (fired2, actions2.calls))
+
+    # 长按中停用 -> 立刻复位速度，不能卡在 2x
+    app3, actions3 = _shoulder_app(cfg)
+    long_s = cfg.rb.long_ms / 1000.0
+    app3.step(PadState(buttons=BUTTON_RIGHT_SHOULDER), now=0.0)
+    app3.step(PadState(buttons=BUTTON_RIGHT_SHOULDER), now=long_s + 0.1)
+    fired3 = app3.step(PadState(), now=long_s + 0.2, toggle=True)
+    check("肩键：长按中停用会立刻复位速度（不卡在 2x）", "set_speed:1x" in fired3, fired3)
+    check("肩键：复位只发一次", actions3.calls.count("set_speed:1x") == 1, actions3.calls)
+    check("肩键：停用后的松手不再补发动作", app3.step(PadState(), now=long_s + 0.3) == [])
+
+
+def test_shoulder_disconnect_mid_hold():
+    cfg = _rb_seek_cfg()
+    app, actions = _shoulder_app(cfg)
+    long_s = cfg.rb.long_ms / 1000.0
+    app.step(PadState(buttons=BUTTON_RIGHT_SHOULDER), now=0.0)
+    app.step(PadState(buttons=BUTTON_RIGHT_SHOULDER), now=long_s + 0.1)
+    check("肩键：断开前已切到 2x", actions.calls == ["set_speed:2x"], actions.calls)
+    app.handle_disconnect()
+    check("肩键：长按中断开补一次 set_speed(1x)", actions.calls == ["set_speed:2x", "set_speed:1x"], actions.calls)
+    app.handle_disconnect()
+    check("肩键：重复断开不会重复复位", actions.calls.count("set_speed:1x") == 1, actions.calls)
+    check(
+        "肩键：断开后重新按下仍是干净的短按",
+        app.step(PadState(buttons=BUTTON_RIGHT_SHOULDER), now=long_s + 0.5) == []
+        and app.step(PadState(), now=long_s + 0.55) == ["seek_forward"],
+    )
+
+
+def test_shoulder_threshold_boundary():
+    cfg = _rb_seek_cfg()
+    long_s = cfg.rb.long_ms / 1000.0
+    app, actions = _shoulder_app(cfg)
+    app.step(PadState(buttons=BUTTON_RIGHT_SHOULDER), now=0.0)
+    fired = app.step(PadState(buttons=BUTTON_RIGHT_SHOULDER), now=long_s)
+    check("肩键：按住正好等于 long_ms 判为长按", fired == ["set_speed:2x"], fired)
+    fired2 = app.step(PadState(), now=long_s + 0.01)
+    check("肩键：边界松开恢复 1x 且不发 seek", fired2 == ["set_speed:1x"], fired2)
+
+    # 轮询卡顿：松手那一帧才发现已经过了阈值
+    app2, actions2 = _shoulder_app(cfg)
+    app2.step(PadState(buttons=BUTTON_RIGHT_SHOULDER), now=0.0)
+    fired3 = app2.step(PadState(), now=long_s + 0.05)
+    check("肩键：松手才跨过阈值仍按长按处理", fired3 == ["set_speed:2x", "set_speed:1x"], fired3)
+    check("肩键：该情形不发 seek", "seek_forward" not in actions2.calls, actions2.calls)
+
+    # 差一点点（long_ms - 1ms）应算短按
+    app3, actions3 = _shoulder_app(cfg)
+    app3.step(PadState(buttons=BUTTON_RIGHT_SHOULDER), now=0.0)
+    fired4 = app3.step(PadState(), now=(long_s * 1000.0 - 1.0) / 1000.0)
+    check("肩键：差 1ms 到阈值算短按", fired4 == ["seek_forward"], fired4)
+
+
+def test_shoulder_action_false_is_logged_only():
+    class _RefusingActions(FakeActions):
+        def set_speed(self, label):
+            self.calls.append("set_speed:%s" % label)
+            return False
+
+    cfg = Config()
+    actions = _RefusingActions()
+    lines = []
+    app = App(cfg, actions, injector=None, out=lines.append)
+    long_s = cfg.rb.long_ms / 1000.0
+    app.step(PadState(buttons=BUTTON_RIGHT_SHOULDER), now=0.0)
+    fired = app.step(PadState(buttons=BUTTON_RIGHT_SHOULDER), now=long_s + 0.1)
+    check("肩键：动作返回 False 仍记录事件", fired == ["set_speed:2x"], fired)
+    check("肩键：返回 False 有明确告警", any("返回失败" in line for line in lines), lines)
+    check("肩键：不会因为 False 而重试", actions.calls.count("set_speed:2x") == 1, actions.calls)
+    app.step(PadState(), now=long_s + 0.15)
+    check(
+        "肩键：返回 False 不影响主循环后续输入",
+        app.step(PadState(buttons=BUTTON_B), now=long_s + 0.2) == ["back"],
+    )
+
+
+def test_shoulder_default_rb_short_is_none():
+    cfg = Config()
+    check("肩键：默认配置 RB 短按留空", cfg.rb.short_action == "none", cfg.rb.short_action)
+    check("肩键：默认配置 LB 短按是后退", cfg.lb.short_action == "seek_backward", cfg.lb.short_action)
+    check("肩键：默认配置 LB 长按档位是 0.75x", cfg.lb.hold_speed == "0.75x", cfg.lb.hold_speed)
+    app, actions = _shoulder_app(cfg)
+    app.step(PadState(buttons=BUTTON_RIGHT_SHOULDER), now=0.0)
+    fired = app.step(PadState(), now=0.05)
+    check("肩键：默认配置下 RB 短按不产生任何动作", fired == [] and actions.calls == [], (fired, actions.calls))
+
+
+def test_injector_click_sequence():
+    cfg = Config()
+    expected_flags = [
+        MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK,
+        MOUSEEVENTF_LEFTDOWN,
+        MOUSEEVENTF_LEFTUP,
+    ]
+
+    stub = StubInjector(cfg, rect=(100, 200, 400, 300), cursor=(10, 20))
+    ok = stub.click_sequence([(0.2, 0.5), (0.8, 0.5)], interval_ms=0, restore=True)
+    batches = [call for call in stub.calls if call[0] == "send"]
+    check("连续点击：两个点 = 恰好两个批次", len(batches) == 2, len(batches))
+    check(
+        "连续点击：每个批次都是 定位+按下+抬起",
+        all([event[1] for event in batch[1]] == expected_flags for batch in batches),
+        [event[1] for batch in batches for event in batch[1]],
+    )
+    flags = [event[1] for batch in batches for event in batch[1]]
+    check(
+        "连续点击：批与批之间没有多余的 MOVE 事件",
+        flags == expected_flags * 2,
+        flags,
+    )
+    xs = [batch[1][0][2] for batch in batches]
+    check("连续点击：两批落在不同 x 上（第二下更靠右）", xs[0] != xs[1] and xs[1] > xs[0], xs)
+    check("连续点击：restore=True 光标回到起点", stub.cursor == (10, 20), stub.cursor)
+    check("连续点击：整体返回 True", ok is True, ok)
+
+    stub2 = StubInjector(cfg, rect=(100, 200, 400, 300), cursor=(10, 20))
+    ok2 = stub2.click_sequence([(0.2, 0.5), (0.8, 0.5)], interval_ms=0, restore=False)
+    check("连续点击：restore=False 不发批次之外的挪动", all(c[0] != "set_cursor" for c in stub2.calls), stub2.calls)
+    check(
+        "连续点击：restore=False 仍完成两个批次",
+        ok2 is True and len([c for c in stub2.calls if c[0] == "send"]) == 2,
+        stub2.calls,
+    )
+
+    stub3 = StubInjector(cfg, rect=(100, 200, 400, 300))
+    check("连续点击：只给 1 个点返回 False", stub3.click_sequence([(0.5, 0.5)]) is False, stub3.calls)
+    check("连续点击：空列表返回 False", stub3.click_sequence([]) is False, stub3.calls)
+    check("连续点击：坐标格式非法返回 False", stub3.click_sequence([("a", "b"), (0.5, 0.5)]) is False, stub3.calls)
+    check("连续点击：上面三种非法输入都是零事件", stub3.events() == [], stub3.events())
+
+    stub4 = StubInjector(cfg, rect=None)
+    check(
+        "连续点击：找不到窗口返回 False 且零事件",
+        stub4.click_sequence([(0.2, 0.5), (0.8, 0.5)]) is False and stub4.events() == [],
+        stub4.calls,
+    )
+
+    lines = []
+    stub5 = StubInjector(cfg, rect=(100, 200, 400, 300), out=lines.append)
+    stub5.dry_run = True
+    ok5 = stub5.click_sequence([(0.2, 0.5), (0.8, 0.5)], interval_ms=0, restore=True)
+    check("连续点击：dry_run 返回 True 但零事件", ok5 is True and stub5.events() == [], (ok5, stub5.events()))
+    check("连续点击：dry_run 有可读输出", any("连续点击" in line for line in lines), lines)
+
+
+class _GrabStub(StubInjector):
+    """把 _grab_roi 打桩，专门验证亮度统计与各种失败分支。"""
+
+    def __init__(self, cfg, grab=None, **kwargs):
+        StubInjector.__init__(self, cfg, **kwargs)
+        self.grab = grab
+        self.grab_calls = 0
+        self.last_region = None
+
+    def _grab_roi(self, region):
+        self.grab_calls += 1
+        self.last_region = region
+        return self.grab
+
+
+class _FakeScreenUser32(object):
+    def __init__(self):
+        self.released = 0
+
+    def GetDC(self, hwnd):
+        return 0x0DC0
+
+    def ReleaseDC(self, hwnd, dc):
+        self.released += 1
+        return 1
+
+
+class _FakeGdi32(object):
+    """记录 GDI 句柄的创建/释放次数，不碰真实屏幕。"""
+
+    def __init__(self, pixel=(255, 255, 255, 0), bitblt_ok=1):
+        self.pixel = bytes(pixel)
+        self.bitblt_ok = bitblt_ok
+        self.deleted_bitmaps = 0
+        self.deleted_dcs = 0
+        self.select_calls = 0
+        self.bitblt_args = None
+        self.getdibits_calls = 0
+
+    def CreateCompatibleDC(self, dc):
+        return 0x1111
+
+    def CreateCompatibleBitmap(self, dc, width, height):
+        return 0x2222
+
+    def SelectObject(self, dc, obj):
+        self.select_calls += 1
+        return 0x3333
+
+    def BitBlt(self, *args):
+        self.bitblt_args = args
+        return self.bitblt_ok
+
+    def GetDIBits(self, dc, bitmap, start, lines, buffer, info, usage):
+        self.getdibits_calls += 1
+        size = ctypes.sizeof(buffer)
+        ctypes.memmove(buffer, self.pixel * (size // 4), size)
+        return lines
+
+    def DeleteObject(self, obj):
+        self.deleted_bitmaps += 1
+        return 1
+
+    def DeleteDC(self, dc):
+        self.deleted_dcs += 1
+        return 1
+
+
+def _uniform(count, bgra):
+    return bytes(bgra) * count
+
+
+def test_bright_ratio_statistics():
+    cfg = Config()
+    roi = (0.0, 0.0, 0.2, 0.2)
+
+    white = _GrabStub(cfg, grab=(4, 4, _uniform(16, (255, 255, 255, 0))))
+    check("亮度采样：全白 -> 1.0", white.sample_bright_ratio(roi) == 1.0, white.last_region)
+
+    black = _GrabStub(cfg, grab=(4, 4, _uniform(16, (0, 0, 0, 0))))
+    check("亮度采样：全黑 -> 0.0", black.sample_bright_ratio(roi) == 0.0, black.last_region)
+
+    half = _GrabStub(cfg, grab=(4, 4, _uniform(8, (255, 255, 255, 0)) + _uniform(8, (0, 0, 0, 0))))
+    ratio = half.sample_bright_ratio(roi)
+    check("亮度采样：一半白一半黑 -> 0.5", ratio == 0.5, ratio)
+
+    gray = _GrabStub(cfg, grab=(4, 4, _uniform(16, (128, 128, 128, 0))))
+    check("亮度采样：中灰按 luma 低于默认阈值 -> 0.0", gray.sample_bright_ratio(roi) == 0.0)
+    check("亮度采样：中灰把阈值降到 100 就算亮 -> 1.0", gray.sample_bright_ratio(roi, lum_threshold=100) == 1.0)
+
+    white_high = _GrabStub(cfg, grab=(4, 4, _uniform(16, (255, 255, 255, 0))))
+    check("亮度采样：阈值高于最大 luma -> 0.0", white_high.sample_bright_ratio(roi, lum_threshold=300) == 0.0)
+
+    no_grab = _GrabStub(cfg, grab=None)
+    check("亮度采样：抓图返回 None -> 返回 None", no_grab.sample_bright_ratio(roi) is None)
+    check("亮度采样：抓图返回 None 前确实试过", no_grab.grab_calls == 1, no_grab.grab_calls)
+
+    short_data = _GrabStub(cfg, grab=(4, 4, b"\x00" * 10))
+    check("亮度采样：像素数据长度不对 -> None", short_data.sample_bright_ratio(roi) is None)
+
+
+def test_bright_ratio_invalid_inputs():
+    cfg = Config()
+    stub = _GrabStub(cfg, grab=(4, 4, _uniform(16, (255, 255, 255, 0))))
+    bad_rois = [
+        (0.5, 0.0, 0.2, 0.2),
+        (0.0, 0.0, 0.0, 0.0),
+        ("a", "b", "c", "d"),
+        (0.0, 0.0, 1.0, float("nan")),
+        (0.0, 0.0, 1.0),
+    ]
+    for bad in bad_rois:
+        check("亮度采样：非法 ROI %r 返回 None" % (bad,), stub.sample_bright_ratio(bad) is None)
+    check("亮度采样：非法 ROI 完全不去抓图", stub.grab_calls == 0, stub.grab_calls)
+
+    no_window = _GrabStub(cfg, grab=(4, 4, _uniform(16, (255, 255, 255, 0))), rect=None)
+    check("亮度采样：没有目标窗口 -> None", no_window.sample_bright_ratio((0.0, 0.0, 0.2, 0.2)) is None)
+    check("亮度采样：没有窗口时不去抓图", no_window.grab_calls == 0, no_window.grab_calls)
+
+    lines = []
+    dry = _GrabStub(cfg, grab=(4, 4, _uniform(16, (255, 255, 255, 0))), out=lines.append)
+    dry.dry_run = True
+    check("亮度采样：dry_run 返回 None", dry.sample_bright_ratio((0.1, 0.1, 0.3, 0.3)) is None)
+    check("亮度采样：dry_run 不读屏", dry.grab_calls == 0, dry.grab_calls)
+    check("亮度采样：dry_run 打印了要采样的区域", any("采样亮度区域" in line for line in lines), lines)
+
+
+def _run_grab_with_fakes(stub, fake_user, fake_gdi):
+    import xbox_douyin.injector as injector_module
+
+    original_user = injector_module._get_user32
+    original_gdi = injector_module._get_gdi32
+    injector_module._get_user32 = lambda: fake_user
+    injector_module._get_gdi32 = lambda: fake_gdi
+    try:
+        return stub.sample_bright_ratio((0.0, 0.0, 0.1, 0.1))
+    finally:
+        injector_module._get_user32 = original_user
+        injector_module._get_gdi32 = original_gdi
+
+
+def test_grab_roi_releases_gdi_handles():
+    cfg = Config()
+    stub = StubInjector(cfg, rect=(100, 200, 100, 100))
+    fake_user = _FakeScreenUser32()
+    fake_gdi = _FakeGdi32(pixel=(255, 255, 255, 0))
+    ratio = _run_grab_with_fakes(stub, fake_user, fake_gdi)
+    check("亮度采样：真实 _grab_roi 路径能跑通", ratio is not None, ratio)
+    check("亮度采样：全白算出 1.0", ratio == 1.0, ratio)
+    check("亮度采样：位图句柄已 DeleteObject", fake_gdi.deleted_bitmaps == 1, fake_gdi.deleted_bitmaps)
+    check("亮度采样：内存 DC 已 DeleteDC", fake_gdi.deleted_dcs == 1, fake_gdi.deleted_dcs)
+    check("亮度采样：屏幕 DC 已 ReleaseDC", fake_user.released == 1, fake_user.released)
+    check("亮度采样：选中的旧对象已还原", fake_gdi.select_calls == 2, fake_gdi.select_calls)
+    check("亮度采样：只抓 ROI 那 10x10 像素", tuple(fake_gdi.bitblt_args[3:5]) == (10, 10), fake_gdi.bitblt_args)
+    check("亮度采样：真的调了 GetDIBits", fake_gdi.getdibits_calls == 1, fake_gdi.getdibits_calls)
+
+    fake_user2 = _FakeScreenUser32()
+    fake_gdi2 = _FakeGdi32(bitblt_ok=0)
+    failed = _run_grab_with_fakes(stub, fake_user2, fake_gdi2)
+    check("亮度采样：BitBlt 失败返回 None", failed is None, failed)
+    check(
+        "亮度采样：失败时 GDI 句柄照样释放干净",
+        fake_gdi2.deleted_bitmaps == 1 and fake_gdi2.deleted_dcs == 1 and fake_user2.released == 1,
+        (fake_gdi2.deleted_bitmaps, fake_gdi2.deleted_dcs, fake_user2.released),
+    )
+
+
 def main():
     print("=== app 引擎离线测试 ===")
     for func in (
@@ -682,6 +1119,20 @@ def main():
         test_build_actions_with_real_douyin,
         test_build_actions_error_is_loud,
         test_cmd_action_exit_codes,
+        test_shoulder_short_press,
+        test_shoulder_long_press,
+        test_shoulder_hold_fires_once,
+        test_shoulder_lb_mirrors_rb,
+        test_shoulder_short_action_none,
+        test_shoulder_disabled,
+        test_shoulder_disconnect_mid_hold,
+        test_shoulder_threshold_boundary,
+        test_shoulder_action_false_is_logged_only,
+        test_shoulder_default_rb_short_is_none,
+        test_injector_click_sequence,
+        test_bright_ratio_statistics,
+        test_bright_ratio_invalid_inputs,
+        test_grab_roi_releases_gdi_handles,
     ):
         func()
     print("---")

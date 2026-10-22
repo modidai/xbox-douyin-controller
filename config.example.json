@@ -35,6 +35,42 @@
     "key_up": "up",
     "key_down": "down"
   },
+  "speed": {
+    "button_x": 0.86,
+    "button_y": 0.9633,
+    "menu_x": 0.8618,
+    "click_interval_ms": 60,
+    "back_key": "left",
+    "back_seconds": 5,
+    "probe_roi": [
+      0.96,
+      0.6591,
+      0.9782,
+      0.6915
+    ],
+    "probe_min_ratio": 0.15,
+    "menu_y": {
+      "0.75x": 0.6817,
+      "1x": 0.7195,
+      "1.25x": 0.7573,
+      "1.5x": 0.7961,
+      "1.75x": 0.8339,
+      "2x": 0.8727,
+      "3x": 0.9115
+    }
+  },
+  "rb": {
+    "long_ms": 400,
+    "short_action": "none",
+    "hold_speed": "2x",
+    "restore_speed": "1x"
+  },
+  "lb": {
+    "long_ms": 400,
+    "short_action": "seek_backward",
+    "hold_speed": "0.75x",
+    "restore_speed": "1x"
+  },
   "like": {
     "method": "double_click",
     "key": "",

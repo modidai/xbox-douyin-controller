@@ -18,7 +18,25 @@ from .config import (
     TriggerConfig,
 )
 from .gestures import DoubleTapDetector, EdgeTrigger, stick_to_mouse_delta
-from .xinput import BUTTON_A, BUTTON_B, BUTTON_X, BUTTON_Y, PadState
+from .xinput import (
+    BUTTON_A,
+    BUTTON_B,
+    BUTTON_LEFT_SHOULDER,
+    BUTTON_RIGHT_SHOULDER,
+    BUTTON_X,
+    BUTTON_Y,
+    PadState,
+)
+
+try:  # 老版本 config.py 没有这些 group，缺了就退回内置默认值
+    from .config import HoldConfig
+except ImportError:  # pragma: no cover
+    HoldConfig = None
+
+try:
+    from .config import SpeedConfig
+except ImportError:  # pragma: no cover
+    SpeedConfig = None
 
 #: 日志级别：数字越大越严重
 _LOG_RANK = {"debug": 0, "info": 1, "warn": 2, "error": 3}
@@ -37,6 +55,12 @@ _GROUP_TYPES = {
     "comments": ActionConfig,
 }
 
+if HoldConfig is not None:
+    _GROUP_TYPES["rb"] = HoldConfig
+    _GROUP_TYPES["lb"] = HoldConfig
+if SpeedConfig is not None:
+    _GROUP_TYPES["speed"] = SpeedConfig
+
 ACTION_LABELS = {
     "swipe_up": "上一条",
     "swipe_down": "下一条",
@@ -46,7 +70,64 @@ ACTION_LABELS = {
     "open_comments": "打开评论",
     "mouse_move": "移动鼠标",
     "click": "点击",
+    "seek_forward": "快进",
+    "seek_backward": "快退",
+    "set_speed": "切换倍速",
 }
+
+#: 肩键在配置缺失时的兜底（与 config.py 的默认值一致）
+_SHOULDER_DEFAULTS = {
+    "rb": ("none", "2x"),
+    "lb": ("seek_backward", "0.75x"),
+}
+
+SHOULDER_BUTTONS = (
+    (BUTTON_RIGHT_SHOULDER, "rb"),
+    (BUTTON_LEFT_SHOULDER, "lb"),
+)
+
+
+def _get(obj, name, default):
+    """兼容 dataclass / dict / None 的取字段。"""
+    if obj is None:
+        return default
+    if isinstance(obj, dict):
+        return obj.get(name, default)
+    return getattr(obj, name, default)
+
+
+class _ShoulderState(object):
+    """单个肩键的状态机：按下只计时，到阈值才切倍速，松开时按长短分流。"""
+
+    __slots__ = (
+        "name",
+        "long_ms",
+        "short_action",
+        "hold_speed",
+        "restore_speed",
+        "down",
+        "armed",
+        "pressed_at",
+        "hold_fired",
+    )
+
+    def __init__(self, name, hold_cfg=None):
+        fallback_short, fallback_speed = _SHOULDER_DEFAULTS.get(name, ("none", "2x"))
+        self.name = name
+        self.long_ms = max(0.0, float(_get(hold_cfg, "long_ms", 400) or 0))
+        self.short_action = str(_get(hold_cfg, "short_action", fallback_short) or "none").strip().lower()
+        self.hold_speed = str(_get(hold_cfg, "hold_speed", fallback_speed) or "")
+        self.restore_speed = str(_get(hold_cfg, "restore_speed", "1x") or "1x")
+        self.down = False
+        self.armed = False
+        self.pressed_at = 0.0
+        self.hold_fired = False
+
+    def reset(self):
+        self.down = False
+        self.armed = False
+        self.pressed_at = 0.0
+        self.hold_fired = False
 
 #: 按键类动作的按下/松开判定点
 _BUTTON_PRESS = 0.5
@@ -94,6 +175,15 @@ class NullActions(object):
     def open_comments(self):
         pass
 
+    def seek_forward(self):
+        pass
+
+    def seek_backward(self):
+        pass
+
+    def set_speed(self, label):
+        pass
+
 
 class _RecordingInjector(object):
     """自检专用假注入器：只记账，绝不碰真实输入。"""
@@ -127,6 +217,9 @@ class App(object):
         self._frame = []
         self._stick_dir = None
         self._stick_next = 0.0
+        self._shoulders = {
+            key: _ShoulderState(key, _get(self.cfg, key, None)) for _mask, key in SHOULDER_BUTTONS
+        }
         self._reset_gestures()
 
     # ---- 日志 ----
@@ -156,6 +249,8 @@ class App(object):
         self._y_edge = EdgeTrigger(_BUTTON_PRESS, _BUTTON_PRESS)
         self._a_tap = DoubleTapDetector(float(tap.window_ms))
         self._y_tap = DoubleTapDetector(float(tap.window_ms))
+        for shoulder in getattr(self, "_shoulders", {}).values():
+            shoulder.reset()
 
     # ---- 启停 ----
     def _poll_toggle(self):
@@ -181,6 +276,9 @@ class App(object):
         self.enabled = enabled
         self._frame.append("toggle_on" if enabled else "toggle_off")
         self.log("[启停] 手柄控制" + ("已启用" if enabled else "已停用"), "info")
+        if not enabled:
+            # 停用瞬间若正处在长按倍速，立刻复位，别把播放速度丢在 2x
+            self._release_active_holds("停用")
         return self.enabled
 
     # ---- 单帧处理 ----
@@ -196,6 +294,8 @@ class App(object):
             self.toggle_enabled()
         if not self.enabled:
             self._last_now = now
+            # 只跟随真实按键状态，绝不产生动作；松手时也不会补发
+            self._discard_shoulders(state)
             fired = self._frame
             self._frame = []
             return fired
@@ -207,6 +307,7 @@ class App(object):
 
         self._step_stick(state, now)
         self._step_buttons(state, now)
+        self._step_shoulders(state, now)
         self._step_trigger(state, now)
         self._step_mouse(state, dt)
 
@@ -267,6 +368,101 @@ class App(object):
                 self._call("favorite")
         if self._x_edge.update(1.0 if state.pressed(BUTTON_X) else 0.0, now):
             self._call("open_comments")
+
+    # ---- 肩键：短按快进/快退，长按倍速 ----
+    def _step_shoulders(self, state, now):
+        for mask, key in SHOULDER_BUTTONS:
+            shoulder = self._shoulders[key]
+            pressed = state.pressed(mask)
+            if pressed and not shoulder.down:
+                # 按下：只开始计时，绝不立刻发短按动作
+                shoulder.down = True
+                shoulder.armed = True
+                shoulder.pressed_at = now
+                shoulder.hold_fired = False
+            elif pressed and shoulder.down:
+                if shoulder.armed and not shoulder.hold_fired:
+                    if (now - shoulder.pressed_at) * 1000.0 >= shoulder.long_ms:
+                        # 到阈值：切倍速，且只切一次（不是每帧重发）
+                        shoulder.hold_fired = True
+                        self._apply_speed(shoulder, shoulder.hold_speed)
+            elif not pressed and shoulder.down:
+                shoulder.down = False
+                armed = shoulder.armed
+                shoulder.armed = False
+                if armed:
+                    self._release_shoulder(shoulder, now)
+                shoulder.hold_fired = False
+
+    def _release_shoulder(self, shoulder, now):
+        elapsed_ms = (now - shoulder.pressed_at) * 1000.0
+        if not shoulder.hold_fired and elapsed_ms >= shoulder.long_ms:
+            # 松手这一帧才发现已过阈值（轮询卡顿等）：仍按长按处理，序列保持完整
+            shoulder.hold_fired = True
+            self._apply_speed(shoulder, shoulder.hold_speed)
+        if shoulder.hold_fired:
+            self._apply_speed(shoulder, shoulder.restore_speed)
+            return
+        action = shoulder.short_action
+        if action in ("", "none"):
+            self.log("[动作] %s 短按未配置动作，忽略" % shoulder.name.upper(), "debug")
+            return
+        self._call_shoulder(action)
+
+    def _apply_speed(self, shoulder, speed_label):
+        if not speed_label:
+            return False
+        return self._call_shoulder("set_speed", speed_label)
+
+    def _call_shoulder(self, method_name, arg=None):
+        func = getattr(self.actions, method_name, None)
+        if not callable(func):
+            self.log("[动作] 动作对象缺少方法 %s" % method_name, "error")
+            return False
+        try:
+            result = func() if arg is None else func(arg)
+        except Exception as exc:
+            self.log("[动作] %s 执行失败: %s" % (method_name, exc), "error")
+            return False
+        record = method_name if arg is None else "%s:%s" % (method_name, arg)
+        self._frame.append(record)
+        label = ACTION_LABELS.get(method_name, method_name)
+        if result is False:
+            # 动作层可能因场景不支持而返回 False（如直播房间没有倍速）：只记录，不重试
+            self.log("[动作] %s（%s）返回失败，已记录不重试" % (label, record), "warn")
+        else:
+            self.log("[动作] %s（%s）" % (label, record), "info")
+        return result is not False
+
+    def _discard_shoulders(self, state):
+        """停用期间：跟随真实按键状态但不产生动作，也不给松手留残局。"""
+        for mask, key in SHOULDER_BUTTONS:
+            shoulder = self._shoulders[key]
+            shoulder.down = state.pressed(mask)
+            shoulder.armed = False
+            shoulder.hold_fired = False
+            shoulder.pressed_at = 0.0
+
+    def _release_active_holds(self, reason):
+        """把还挂在长按倍速上的肩键复位（停用 / 断开 / 退出时用）。"""
+        for shoulder in self._shoulders.values():
+            if shoulder.hold_fired:
+                shoulder.hold_fired = False
+                self.log("[动作] %s 长按未正常松开（%s），补一次速度复位" % (shoulder.name.upper(), reason), "debug")
+                self._apply_speed(shoulder, shoulder.restore_speed)
+
+    def handle_disconnect(self):
+        """手柄断开：按「视为松开」处理，宁可多发一次复位，也不卡在 2x。"""
+        self._release_active_holds("断开")
+        for shoulder in self._shoulders.values():
+            shoulder.reset()
+        for edge in (self._stick_up, self._stick_down, self._a_edge, self._b_edge, self._x_edge, self._y_edge, self._rt):
+            edge.reset()
+        self._a_tap.reset()
+        self._y_tap.reset()
+        self._stick_dir = None
+        self._stick_next = 0.0
+        self.log("[手柄] 已清空输入状态", "debug")
 
     def _step_trigger(self, state, now):
         if not self._rt.update(float(state.right_trigger), now):
@@ -329,6 +525,7 @@ class App(object):
                 state = reader.read(slot)
                 if state is None:
                     self.log("[手柄] 槽位 %d 连接断开" % slot, "error")
+                    self.handle_disconnect()
                     slot = self._reconnect(reader)
                     if slot is None:
                         break
@@ -357,6 +554,7 @@ class App(object):
 
     def close(self):
         self._running = False
+        self._release_active_holds("退出")
         closer = getattr(self.injector, "close", None)
         if callable(closer):
             try:
@@ -412,6 +610,21 @@ class App(object):
         # X 单击 -> open_comments
         add(frame_ms, buttons=BUTTON_X)
         add(frame_ms, buttons=0)
+        # 肩键短按（松开才发）：RB 默认 short_action="none" 因此无动作，LB 默认 seek_backward
+        shoulder_short_ms = max(1, int(float(getattr(cfg, "rb", None).long_ms if getattr(cfg, "rb", None) else 400) // 2))
+        add(frame_ms, buttons=BUTTON_RIGHT_SHOULDER)
+        add(shoulder_short_ms, buttons=0)
+        add(frame_ms, buttons=BUTTON_LEFT_SHOULDER)
+        add(shoulder_short_ms, buttons=0)
+        # 肩键长按 -> 倍速（阈值那帧切一次），松开恢复
+        add(frame_ms, buttons=BUTTON_RIGHT_SHOULDER)
+        add(shoulder_short_ms, buttons=BUTTON_RIGHT_SHOULDER)
+        add(shoulder_short_ms, buttons=BUTTON_RIGHT_SHOULDER)
+        add(int(float(cfg.rb.long_ms)) + 20, buttons=BUTTON_RIGHT_SHOULDER)
+        add(frame_ms, buttons=0)
+        add(frame_ms, buttons=BUTTON_LEFT_SHOULDER)
+        add(int(float(cfg.lb.long_ms)) + 20, buttons=BUTTON_LEFT_SHOULDER)
+        add(frame_ms, buttons=0)
         # 右摇杆 -> 鼠标移动
         add(50, ry=0.9)
         add(frame_ms, ry=0.0)
@@ -428,6 +641,9 @@ class App(object):
         add(frame_ms, buttons=BUTTON_A)
         add(frame_ms, right_trigger=1.0)
         add(frame_ms, ry=0.9)
+        add(frame_ms, buttons=BUTTON_RIGHT_SHOULDER)
+        add(int(float(cfg.rb.long_ms)) + 20, buttons=BUTTON_RIGHT_SHOULDER)
+        add(frame_ms, buttons=0)
         # F8 启用：恢复
         add(frame_ms, toggle=True)
         add(frame_ms, ly=0.0)
@@ -482,5 +698,9 @@ def _describe_pad(state):
         parts.append("X")
     if state.buttons & BUTTON_Y:
         parts.append("Y")
+    if state.buttons & BUTTON_LEFT_SHOULDER:
+        parts.append("LB")
+    if state.buttons & BUTTON_RIGHT_SHOULDER:
+        parts.append("RB")
     parts_text = ("按键 " + "+".join(parts)) if parts else "按键 -"
     return "左(%.2f) 右(%.2f) RT=%.2f %s" % (state.ly, state.ry, state.right_trigger, parts_text)

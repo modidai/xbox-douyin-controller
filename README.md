@@ -1,7 +1,8 @@
 # xbox-douyin-controller · Xbox 手柄刷抖音
 
-用手柄躺着刷抖音：**左摇杆上下切视频、双击 A 点赞、B 返回、双击 Y 收藏、X 打开评论、右摇杆当鼠标、RT 点击。**
-纯 Python 标准库实现（`ctypes` 直调 XInput + SendInput），**不需要 pip install 任何东西**，也不需要 DS4Windows / reWASD 之类的中间层。
+用手柄躺着刷抖音：**左摇杆上下切视频、双击 A 点赞、B 返回、双击 Y 收藏、X 打开评论、右摇杆当鼠标、RT 点击、
+LB/RB 快退与倍速**。纯 Python 标准库实现（`ctypes` 直调 XInput + SendInput），**不需要 pip install 任何东西**，
+也不需要 DS4Windows / reWASD 之类的中间层。
 
 ## 按键映射
 
@@ -14,16 +15,21 @@
 | X | 打开评论 | 点击右侧评论气泡 (0.9685, 0.5922) |
 | 右摇杆 | 鼠标移动 | 相对位移，带死区 + 响应曲线 + 限速 |
 | RT | 鼠标左键点击 | 在光标当前位置点击 |
+| **RB 长按** | **2 倍速播放**，松开恢复 1x | 点「倍速」按钮 → 点菜单里的 2.0x（两段连点，中间不移动光标） |
+| **LB 长按** | **0.75x 慢放**，松开恢复 1x | 同上，点菜单里的 0.75x（客户端菜单最低档就是 0.75x） |
+| **LB 短按** | **后退 5 秒** | 发客户端原生的 `←`（这是它唯一的 seek 快捷键） |
+| RB 短按 | *（留空）* | 客户端没有「前进」快捷键，见下节 |
 | F8 | 手柄映射 开 / 关 | 全局热键（不用手柄玩游戏时关掉） |
 
-坐标是相对**抖音窗口客户区**的归一化值，全部来自真机实测（见 [docs/CALIBRATION.md](docs/CALIBRATION.md)），换分辨率或客户端改版可以用 `tools/measure.py` 重新量。
+坐标是相对**抖音窗口客户区**的归一化值，全部来自真机实测（见 [docs/CALIBRATION.md](docs/CALIBRATION.md)），
+换分辨率或客户端改版可以用 `tools/measure.py` 重新量。
 
 ## 环境要求
 
 - Windows 10 / 11
 - Python 3.8+（开发与验证环境是 3.8.6）
 - 有线 / 无线 Xbox 手柄（XInput 能识别即可，槽位 1-4 自动探测）
-- 抖音桌面客户端（`douyin.exe`）；浏览器网页版也能用（见下文"兼容性"）
+- 抖音桌面客户端（`douyin.exe`）；浏览器网页版也能用（见"已知限制"）
 
 ## 快速开始
 
@@ -44,7 +50,8 @@ python run.py                    # 正式运行（真实注入键鼠事件）
 python run.py --dry-run          # 不注入，只打印将要执行的动作（调参/排障用）
 python run.py --selftest         # 离线自检：脚本化假手柄走完整条流水线，打印动作序列
 python run.py --init-config      # 把默认配置写到 %APPDATA%\xbox-douyin-controller\config.json
-python run.py --action comments  # 只执行一次某个动作（like/back/favorite/comments/swipe_up/swipe_down）
+python run.py --action comments  # 只执行一次某个动作
+                                 # like/back/favorite/comments/swipe_up/swipe_down/seek_forward/seek_backward
 python run.py --config PATH      # 用指定配置文件
 python run.py --verbose          # 输出 debug 日志
 ```
@@ -63,19 +70,27 @@ python run.py --verbose          # 输出 debug 日志
 | `mouse.invert_y` | true | XInput 上推是 +Y、屏幕向下是 +Y，所以默认要反转 |
 | `tap.window_ms` | 350 | 双击判定窗口（A / Y） |
 | `trigger.threshold` | 0.5 | RT 按多深算一次点击 |
-| `ensure_foreground` | true | 发键盘/滚轮前先把抖音拉到前台，否则"抖音不在前台就不发"（安全侧失败） |
+| `rb.long_ms` / `lb.long_ms` | 400 | 肩键按住多久算长按（短按动作在松开时才发） |
+| `rb.hold_speed` | "2x" | RB 长按期间的倍速档位 |
+| `lb.hold_speed` | "0.75x" | LB 长按期间的慢放档位（菜单最低档） |
+| `speed.button_x/y`、`speed.menu_y` | — | 倍速按钮与 7 个档位的坐标，换分辨率时改这里 |
+| `ensure_foreground` | true | 发键盘/滚轮前先把抖音拉到前台，抢不到就一个事件都不发 |
 | `restore_cursor` | true | 点完右侧图标把光标放回原处 |
 
-## 实测出来的三条结论（决定了默认值）
+## 实测出来的几条结论（决定了默认值）
 
 1. **切视频按"事件个数"算，不按滚动量**：`wheel(-1)` / `wheel(-3)` / `ArrowDown` 都只切 1 条，±120 与 ±360 等价。
    所以 `swipe.notches` 恒为 1 —— 填 3 会一次跳 3 条。
-2. **滚轮只在光标位于视频区时有效**：光标停在左侧导航栏时滚轮被导航吞掉，视频纹丝不动。
-   动作层会先把光标移到视频中部 (0.5, 0.45) 再滚，滚完还原。
-3. **Esc / Alt+← 都不是可靠的"返回上一级"**（在 feed、抽屉、一级页、详情页实测都无反应），
-   唯一确证有效的是 Esc 关弹出层。所以 B 采用"Esc → Alt+←"串发：两者在首页都是空操作，
-   不会把用户带到别处，有弹出层/有历史时至少命中一个。要硬返回可以把 `back` 改成点击
-   （关抽屉 × = 0.9830/0.0863、回首页 = 0.0515/0.1435，详见校准文档）。
+2. **滚轮只在光标位于视频区时有效**：光标停在左侧导航栏时滚轮被导航吞掉。动作层先把光标移到视频中部再滚，滚完还原。
+3. **Esc / Alt+← 都不是可靠的"返回上一级"**，唯一确证有效的是 Esc 关弹出层；所以 B 用"Esc → Alt+←"串发
+   （两者在首页都是空操作，不会把用户带到别处）。
+4. **客户端没有"前进"seek**：`←`/`Shift+←` 后退 5 秒，`→` 完全无效（试了 10+ 次），
+   J/L/`,`/`.`/PgUp/PgDn 等 20 个候选键全无反应。所以 **RB 短按留空**，LB 短按才有的可靠后退。
+5. **倍速没有快捷键**，只能点「倍速」按钮再从菜单选档位。菜单是 hover 层：两次点击之间**不能移动光标**，
+   否则菜单消失、第二下会落到视频上（= 误触发播放/暂停）。为此注入层提供了 `click_sequence` 连点原语。
+6. **倍速是粘性状态**（换下一条视频仍保持），所以长按松开必须真的把 1.0x 点回去。
+7. **直播房间没有倍速按钮**，点下去会打到连播开关/弹幕区。`set_speed` 会先采样右侧收藏星形区域
+   （`speed.probe_roi`）判断当前是不是普通视频，不像就一个点击都不发。
 
 ## 重新校准
 
@@ -95,22 +110,22 @@ python tools/measure.py --crosshair --shot          # 在截图上画出当前�
 run.py                 命令行入口（装配 Injector + DouyinActions + App）
 xbox_douyin/
   xinput.py            XInput 轮询（ctypes，自动探测槽位 1-4）
-  injector.py          SendInput 注入（鼠标/滚轮/按键/绝对点击，含前台守卫与光标还原）
+  injector.py          SendInput 注入（鼠标/滚轮/按键/绝对点击/连点/区域亮度采样，含前台守卫与光标还原）
   gestures.py          纯逻辑：迟滞触发 / 双击判定 / 摇杆→鼠标曲线（无 Windows 依赖，可单测）
-  app.py               主循环、F8 启停、日志、离线自检
-  douyin.py            抖音动作层：切视频 / 点赞 / 收藏 / 评论 / 返回
+  app.py               主循环、F8 启停、肩键长短按状态机、日志、离线自检
+  douyin.py            抖音动作层：切视频 / 点赞 / 收藏 / 评论 / 返回 / 快退 / 倍速
   config.py            配置对象（dataclass + JSON 读写）
-tests/                 test_gestures（38 项）· test_app_selftest（103 项）· test_douyin（10 项）
+tests/                 test_gestures · test_app_selftest · test_douyin（全部离线，不真注入）
 tools/smoke_test.py    真注入端到端验证：tkinter 靶子窗口，抢不到前台就 SKIP 不注入
 tools/measure.py       窗口校准助手（截图 / 准星 / 坐标换算）
-docs/CALIBRATION.md    五项真机实验的完整记录与风险登记
+docs/CALIBRATION.md    全部真机实验记录（切视频、点赞落点、图标坐标、返回键、快进/倍速、守卫）与风险登记
 ```
 
 ## 测试
 
 ```powershell
 python tests/test_gestures.py        # 手势纯逻辑
-python tests/test_app_selftest.py    # 主循环 + 注入器（全部打桩，不真注入）
+python tests/test_app_selftest.py    # 主循环 + 肩键状态机 + 注入器（全部打桩，不真注入）
 python tests/test_douyin.py          # 动作层（假 Injector）
 python run.py --selftest             # 端到端离线自检
 python tools/smoke_test.py           # 真注入验证：只打自己的 tkinter 窗口，抢不到前台就 SKIP
@@ -118,13 +133,17 @@ python tools/smoke_test.py           # 真注入验证：只打自己的 tkinter
 
 ## 兼容性 / 已知限制
 
-- **浏览器网页版**同样可用：滚轮切视频、双击点赞、Esc 返回都是网页版原生支持的手势；
-  收藏/评论坐标是按桌面客户端 1651×928 客户区量的，网页版需要自己用 `tools/measure.py` 重新量。
-- **直播房间**右侧 UI 与普通视频不同（没有那条竖排按钮栏），此时 0.9685 一列会点到别的控件 —— 已知限制。
+- **浏览器网页版**：滚轮切视频、双击点赞、Esc 返回都是网页版原生支持的手势；
+  收藏/评论/倍速坐标是按桌面客户端 1651×928 客户区量的，网页版需自己用 `tools/measure.py` 重新量。
+- **直播房间**：右侧 UI 与普通视频不同（没有竖排按钮栏，也没有倍速按钮）。
+  倍速守卫用"收藏星形区域亮度"判断（普通视频稳定 ~0.30，暗背景直播 <0.07），
+  但**亮背景直播会漏判**，仍不建议在直播间用倍速。
 - **评论抽屉打开时按钮栏整体左移 419px**（0.9685 → 0.7145），此时再按原坐标会点进抽屉内容。先按 B 关掉抽屉。
-- 键盘类动作（Esc / 方向键）要求抖音在前台；本程序会先抢前台，抢不到就**一个按键都不发**并告警。
-- 未做 DPI 感知：绝对是按物理像素算的，本机（per-monitor-v2，100%）落点精确，125%/150% 缩放的机器请用 `measure.py` 复校。
-- 只支持 XInput（Xbox 系）手柄；DualShock 需自行用 DS4Windows 之类映射成 XInput。
+- **倍速依赖菜单坐标**：客户端改版就可能失效，用 `tools/measure.py --report` 复校。
+- **速度是"发点击"而不是"已验证"**：程序没有读屏 OCR 能力，`set_speed` 返回 True 只代表点击已发出。
+- 键盘类动作（Esc / ←）要求抖音在前台；本程序会先抢前台，抢不到就**一个按键都不发**并告警。
+- 未做 DPI 感知：绝对坐标按物理像素算，本机（per-monitor-v2，100%）落点精确，125%/150% 缩放请用 `measure.py` 复校。
+- 只支持 XInput（Xbox 系）手柄；DualShock 需自行映射成 XInput。
 
 ## 免责声明
 

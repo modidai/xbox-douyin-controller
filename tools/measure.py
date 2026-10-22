@@ -374,6 +374,24 @@ def main(argv=None):
             if swipe is not None:
                 print("")
                 print("切视频: method=%s notches=%s" % (swipe.method, swipe.notches))
+        speed = getattr(cfg, "speed", None)
+        if speed is not None:
+            sx, sy = to_absolute(rect, speed.button_x, speed.button_y)
+            print("")
+            print("倍速按钮: (%.4f, %.4f) -> 绝对像素 (%d, %d)"
+                  % (speed.button_x, speed.button_y, sx, sy))
+            menu_y = getattr(speed, "menu_y", {}) or {}
+            if menu_y:
+                menu_x = getattr(speed, "menu_x", speed.button_x)
+                mx, _ = to_absolute(rect, menu_x, 0.0)
+                print("倍速菜单: x=%.4f -> 绝对像素 x=%d，档位（菜单自上而下）:"
+                      % (menu_x, mx))
+                for key in sorted(menu_y, key=lambda k: menu_y[k]):
+                    _, my = to_absolute(rect, 0.0, menu_y[key])
+                    print("  %-7s y=%.4f -> 绝对像素 y=%d" % (key, menu_y[key], my))
+            print("快退: 按键 %s（客户端原生后退 %s 秒）；快进: 客户端没有前进 seek，动作为空"
+                  % (getattr(speed, "back_key", "left"),
+                     getattr(speed, "back_seconds", 5)))
 
     if args.x is not None or args.y is not None:
         nx = 0.5 if args.x is None else args.x

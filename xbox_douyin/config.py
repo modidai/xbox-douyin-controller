@@ -8,7 +8,7 @@ from __future__ import annotations
 import json
 import os
 from dataclasses import dataclass, field, fields, asdict
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 
 
 @dataclass
@@ -45,6 +45,44 @@ class TapConfig:
 
 
 @dataclass
+class SpeedConfig:
+    """倍速菜单的坐标（抖音 PC 客户端只有「后退 5 秒」，没有前进 seek，倍速也没快捷键）。
+
+    实现是「点倍速按钮 → 点档位」两段连点，中间绝不能移动光标：
+    菜单是 hover 层，光标一离开就消失，第二次点击会落到视频画面上（= 播放/暂停）。
+    """
+    button_x: float = 0.8600
+    button_y: float = 0.9633
+    menu_x: float = 0.8618
+    click_interval_ms: int = 60      # 两段连点的间隔，实测需 <=120ms
+    back_key: str = "left"           # 后退快捷键（客户端原生后退 5 秒）
+    back_seconds: int = 5
+    # 直播房间没有倍速按钮，点下去会打到连播/弹幕区。用"右侧收藏五角星区域有没有亮像素"判断
+    # 当前是不是普通视频：按钮栏不随控制条淡出（实测普通视频稳定 ~0.30），直播房间明显更低。
+    # 归一化的 (x1, y1, x2, y2)，实测收藏星形在客户区 (1585,612)-(1615,642)
+    probe_roi: Tuple[float, float, float, float] = (0.9600, 0.6591, 0.9782, 0.6915)
+    probe_min_ratio: float = 0.15    # ROI 里亮度 >= 阈值 的像素占比低于此值 → 判定不是普通视频
+    menu_y: Dict[str, float] = field(default_factory=lambda: {
+        "0.75x": 0.6817,
+        "1x": 0.7195,
+        "1.25x": 0.7573,
+        "1.5x": 0.7961,
+        "1.75x": 0.8339,
+        "2x": 0.8727,
+        "3x": 0.9115,
+    })
+
+
+@dataclass
+class HoldConfig:
+    """肩键的「短按 / 长按」双动作（RB 快进+倍速，LB 后退+慢放）。"""
+    long_ms: int = 400            # 按住超过这么久算长按；短按动作在松开时才发
+    short_action: str = "seek_forward"   # seek_forward | seek_backward | none
+    hold_speed: str = "2x"        # 长按期间切换到的播放速度（抖音菜单里的档位名）
+    restore_speed: str = "1x"     # 松开后恢复的速度
+
+
+@dataclass
 class SwipeConfig:
     """切视频的实现方式：滚轮 或 方向键。"""
     method: str = "wheel"       # "wheel" | "key"
@@ -78,6 +116,10 @@ class Config:
     trigger: TriggerConfig = field(default_factory=TriggerConfig)
     tap: TapConfig = field(default_factory=TapConfig)
     swipe: SwipeConfig = field(default_factory=SwipeConfig)
+    speed: SpeedConfig = field(default_factory=SpeedConfig)
+    # 用户决定：RB 短按留空（客户端没有前进 seek），RB 长按 2x；LB 短按后退 5 秒，LB 长按 0.75x（菜单最低档）
+    rb: HoldConfig = field(default_factory=lambda: HoldConfig(short_action="none", hold_speed="2x"))
+    lb: HoldConfig = field(default_factory=lambda: HoldConfig(short_action="seek_backward", hold_speed="0.75x"))
     # 下面四组默认值来自本机抖音客户端实测（docs/CALIBRATION.md），换分辨率/改版后请用
     # tools/measure.py 重新量，或直接改 %APPDATA%\xbox-douyin-controller\config.json
     like: ActionConfig = field(default_factory=lambda: ActionConfig(method="double_click", x=0.5000, y=0.4500))
@@ -128,6 +170,9 @@ _GROUPS = {
     "trigger": TriggerConfig,
     "tap": TapConfig,
     "swipe": SwipeConfig,
+    "speed": SpeedConfig,
+    "rb": HoldConfig,
+    "lb": HoldConfig,
     "like": ActionConfig,
     "back": ActionConfig,
     "favorite": ActionConfig,

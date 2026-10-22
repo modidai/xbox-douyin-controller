@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import ctypes
+import math
 import sys
 import time
 
@@ -128,8 +129,38 @@ class INPUT(ctypes.Structure):
     _fields_ = [("type", DWORD), ("u", _INPUTUNION)]
 
 
+# --- GDI 截图（亮度采样用）---
+SRCCOPY = 0x00CC0020
+DIB_RGB_COLORS = 0
+
+HDC = ctypes.c_void_p
+HBITMAP = ctypes.c_void_p
+HANDLE = ctypes.c_void_p
+
+
+class BITMAPINFOHEADER(ctypes.Structure):
+    _fields_ = [
+        ("biSize", DWORD),
+        ("biWidth", LONG),
+        ("biHeight", LONG),
+        ("biPlanes", WORD),
+        ("biBitCount", WORD),
+        ("biCompression", DWORD),
+        ("biSizeImage", DWORD),
+        ("biXPelsPerMeter", LONG),
+        ("biYPelsPerMeter", LONG),
+        ("biClrUsed", DWORD),
+        ("biClrImportant", DWORD),
+    ]
+
+
+class BITMAPINFO(ctypes.Structure):
+    _fields_ = [("bmiHeader", BITMAPINFOHEADER), ("bmiColors", DWORD * 3)]
+
+
 _user32 = None
 _kernel32 = None
+_gdi32 = None
 
 
 def _get_user32():
@@ -168,6 +199,10 @@ def _get_user32():
         user32.GetCursorPos.argtypes = [ctypes.POINTER(_POINT)]
         user32.SetCursorPos.argtypes = [ctypes.c_int, ctypes.c_int]
         user32.GetSystemMetrics.argtypes = [ctypes.c_int]
+        user32.GetDC.restype = HDC
+        user32.GetDC.argtypes = [HWND]
+        user32.ReleaseDC.restype = ctypes.c_int
+        user32.ReleaseDC.argtypes = [HWND, HDC]
         _user32 = user32
     return _user32
 
@@ -185,6 +220,30 @@ def _get_kernel32():
         kernel32.CloseHandle.argtypes = [HWND]
         _kernel32 = kernel32
     return _kernel32
+
+
+def _get_gdi32():
+    global _gdi32
+    if _gdi32 is None:
+        if not IS_WINDOWS:
+            return None
+        gdi32 = ctypes.WinDLL("gdi32", use_last_error=True)
+        gdi32.CreateCompatibleDC.restype = HDC
+        gdi32.CreateCompatibleDC.argtypes = [HDC]
+        gdi32.CreateCompatibleBitmap.restype = HBITMAP
+        gdi32.CreateCompatibleBitmap.argtypes = [HDC, ctypes.c_int, ctypes.c_int]
+        gdi32.SelectObject.restype = HANDLE
+        gdi32.SelectObject.argtypes = [HDC, HANDLE]
+        gdi32.BitBlt.restype = ctypes.c_int
+        gdi32.BitBlt.argtypes = [HDC, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, HDC, ctypes.c_int, ctypes.c_int, DWORD]
+        gdi32.GetDIBits.restype = ctypes.c_int
+        gdi32.GetDIBits.argtypes = [HDC, HBITMAP, ctypes.c_uint, ctypes.c_uint, ctypes.c_void_p, ctypes.POINTER(BITMAPINFO), ctypes.c_uint]
+        gdi32.DeleteObject.restype = ctypes.c_int
+        gdi32.DeleteObject.argtypes = [HANDLE]
+        gdi32.DeleteDC.restype = ctypes.c_int
+        gdi32.DeleteDC.argtypes = [HDC]
+        _gdi32 = gdi32
+    return _gdi32
 
 
 def vk_for(name):
@@ -306,6 +365,147 @@ class Injector(object):
             return True
         self._warn_throttled("[注入] 抖音不在前台，已跳过%s" % what)
         return False
+
+    # ---- 区域亮度采样（判断是不是普通视频；直播房间没有倍速按钮）----
+    def sample_bright_ratio(self, roi, lum_threshold=160):
+        """采样客户区某区域的亮度占比。拿不到就返回 None，绝不阻断调用方。
+
+        roi: 客户区归一化 (x1, y1, x2, y2)
+        返回: luma >= lum_threshold 的像素占比 0..1，或 None
+        """
+        rect = self.target_client_rect()
+        if rect is None:
+            self._warn_throttled("[注入] 没找到目标窗口，无法采样亮度")
+            return None
+        region = self._roi_to_screen(rect, roi)
+        if region is None:
+            self._warn_throttled("[注入] 亮度采样区域非法，已跳过")
+            return None
+        if self.dry_run:
+            self._dry(
+                "采样亮度区域 屏幕(%d, %d, %d, %d)，阈值 %d（dry-run 不读屏）"
+                % (region[0], region[1], region[2], region[3], int(lum_threshold))
+            )
+            return None
+        try:
+            grab = self._grab_roi(region)
+        except Exception as exc:
+            self._log("[注入] 亮度采样失败: %s" % exc)
+            return None
+        if grab is None:
+            return None
+        return self._bright_ratio_from_pixels(grab, lum_threshold)
+
+    def _roi_to_screen(self, rect, roi):
+        """归一化 ROI -> 屏幕像素 (x, y, w, h)；非法返回 None。"""
+        try:
+            values = [float(item) for item in roi]
+        except Exception:
+            return None
+        if len(values) != 4:
+            return None
+        if any(math.isnan(value) or math.isinf(value) for value in values):
+            return None
+        x1, y1, x2, y2 = values
+        if x2 <= x1 or y2 <= y1:
+            return None
+        left, top, width, height = rect
+        screen_x1 = int(round(left + min(max(x1, 0.0), 1.0) * width))
+        screen_y1 = int(round(top + min(max(y1, 0.0), 1.0) * height))
+        screen_x2 = int(round(left + min(max(x2, 0.0), 1.0) * width))
+        screen_y2 = int(round(top + min(max(y2, 0.0), 1.0) * height))
+        region_w = screen_x2 - screen_x1
+        region_h = screen_y2 - screen_y1
+        if region_w <= 0 or region_h <= 0:
+            return None
+        return (screen_x1, screen_y1, region_w, region_h)
+
+    def _grab_roi(self, region):
+        """抓屏幕上一小块，返回 (w, h, BGRA bytes) 或 None。
+
+        走屏幕而不是 PrintWindow：此时目标窗口由 ensure_foreground 保证在前台。
+        只抓 ROI 那几十像素，GDI 句柄用完立刻释放。
+        """
+        user32 = _get_user32()
+        gdi32 = _get_gdi32()
+        if user32 is None or gdi32 is None:
+            return None
+        x, y, width, height = [int(item) for item in region]
+        if width <= 0 or height <= 0:
+            return None
+        screen_dc = user32.GetDC(None)
+        if not screen_dc:
+            return None
+        mem_dc = None
+        bitmap = None
+        old_bitmap = None
+        try:
+            mem_dc = gdi32.CreateCompatibleDC(screen_dc)
+            if not mem_dc:
+                return None
+            bitmap = gdi32.CreateCompatibleBitmap(screen_dc, width, height)
+            if not bitmap:
+                return None
+            old_bitmap = gdi32.SelectObject(mem_dc, bitmap)
+            if not gdi32.BitBlt(mem_dc, 0, 0, width, height, screen_dc, x, y, SRCCOPY):
+                return None
+            info = BITMAPINFO()
+            header = info.bmiHeader
+            header.biSize = ctypes.sizeof(BITMAPINFOHEADER)
+            header.biWidth = width
+            header.biHeight = -height  # 负高度 = 自上而下
+            header.biPlanes = 1
+            header.biBitCount = 32
+            header.biCompression = 0  # BI_RGB
+            buffer = ctypes.create_string_buffer(width * height * 4)
+            lines = gdi32.GetDIBits(mem_dc, bitmap, 0, height, buffer, ctypes.byref(info), DIB_RGB_COLORS)
+            if not lines:
+                return None
+            return (width, height, buffer.raw)
+        finally:
+            # 句柄一律释放，顺序：还原选中的旧对象 -> 删位图 -> 删内存 DC -> 释放屏幕 DC
+            if mem_dc and old_bitmap:
+                gdi32.SelectObject(mem_dc, old_bitmap)
+            if bitmap:
+                gdi32.DeleteObject(bitmap)
+            if mem_dc:
+                gdi32.DeleteDC(mem_dc)
+            user32.ReleaseDC(None, screen_dc)
+
+    def _bright_ratio_from_pixels(self, grab, lum_threshold):
+        """(w, h, BGRA) -> 亮像素占比。像素太多时按步长抽样，保证不卡主循环。"""
+        try:
+            width, height, data = grab
+            width = int(width)
+            height = int(height)
+        except Exception:
+            return None
+        if width <= 0 or height <= 0 or not data:
+            return None
+        need = width * height * 4
+        if len(data) < need:
+            return None
+        threshold = float(lum_threshold)
+        total_pixels = width * height
+        stride = 1
+        if total_pixels > 65536:
+            stride = int(math.ceil(math.sqrt(total_pixels / 65536.0)))
+        bright = 0
+        counted = 0
+        row_bytes = width * 4
+        for row in range(0, height, stride):
+            offset = row * row_bytes
+            for col in range(0, width, stride):
+                index = offset + col * 4
+                blue = data[index]
+                green = data[index + 1]
+                red = data[index + 2]
+                if 0.114 * blue + 0.587 * green + 0.299 * red >= threshold:
+                    bright += 1
+                counted += 1
+        if not counted:
+            return None
+        return bright / float(counted)
 
     def _target_window(self):
         """目标窗口条目（hwnd/title/client/process），找不到返回 None。"""
@@ -440,11 +640,9 @@ class Injector(object):
                 getattr(self.cfg, "target_process", ""),
             ))
             return
-        left, top, width, height = rect
         x = min(max(float(x), 0.0), 1.0)
         y = min(max(float(y), 0.0), 1.0)
-        target_x = int(round(left + x * width))
-        target_y = int(round(top + y * height))
+        target_x, target_y = self._client_to_screen(rect, x, y)
         if self.dry_run:
             self._dry(
                 "点击客户区(%.2f, %.2f) -> 屏幕(%d, %d)%s"
@@ -457,6 +655,69 @@ class Injector(object):
             if self.settle_s > 0:
                 time.sleep(self.settle_s)
             self._restore_cursor(saved)
+
+    def _client_to_screen(self, rect, nx, ny):
+        """客户区归一化坐标 -> 屏幕像素坐标（越界会夹到 0..1）。"""
+        left, top, width, height = rect
+        nx = min(max(float(nx), 0.0), 1.0)
+        ny = min(max(float(ny), 0.0), 1.0)
+        return (int(round(left + nx * width)), int(round(top + ny * height)))
+
+    def click_sequence(self, points, interval_ms=60, restore=True):
+        """连续点多个点（hover 菜单专用）。
+
+        用于「点倍速按钮 -> 点档位」这种两段连点：中间**不移动光标、不还原**，
+        否则 hover 菜单会消失、第二下落到视频画面上变成播放/暂停。
+        每个点都走同一条 _absolute_click_inputs 批次（绝对定位+按下+抬起）。
+        """
+        try:
+            coords = [(float(item[0]), float(item[1])) for item in points]
+        except Exception:
+            self._warn_throttled("[注入] 连续点击的坐标格式不对，已跳过")
+            return False
+        if len(coords) < 2:
+            self._warn_throttled("[注入] 连续点击至少要 2 个点，已跳过")
+            return False
+        rect = self.target_client_rect()
+        if rect is None:
+            self._warn(
+                "[注入] 没找到目标窗口（%s / %s），跳过连续点击"
+                % (
+                    getattr(self.cfg, "target_window", ""),
+                    getattr(self.cfg, "target_process", ""),
+                )
+            )
+            return False
+        targets = [self._client_to_screen(rect, nx, ny) for nx, ny in coords]
+        if self.dry_run:
+            self._dry(
+                "连续点击 %d 个点 %s（间隔 %dms%s）"
+                % (
+                    len(targets),
+                    ", ".join("(%d, %d)" % point for point in targets),
+                    int(interval_ms),
+                    "，最后还原光标" if restore else "",
+                )
+            )
+            return True
+
+        saved = self.cursor_pos() if restore else None
+        gap_s = max(0, int(interval_ms)) / 1000.0
+        for index, (target_x, target_y) in enumerate(targets):
+            if index > 0 and gap_s > 0:
+                time.sleep(gap_s)
+            try:
+                self._send(self._absolute_click_inputs(target_x, target_y))
+            except Exception as exc:
+                self._log("[注入] 连续点击第 %d 个点失败: %s" % (index + 1, exc))
+                if saved is not None:
+                    self._restore_cursor(saved)
+                return False
+        if saved is not None:
+            if self.settle_s > 0:
+                time.sleep(self.settle_s)
+            self._restore_cursor(saved)
+        return True
 
     def _absolute_click_inputs(self, x, y):
         """屏幕坐标 -> 单个 SendInput 批次（绝对定位 + 左键按下 + 抬起）。"""
