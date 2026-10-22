@@ -61,6 +61,8 @@ class SpeedConfig:
     # 当前是不是普通视频：按钮栏不随控制条淡出（实测普通视频稳定 ~0.30），直播房间明显更低。
     # 归一化的 (x1, y1, x2, y2)，实测收藏星形在客户区 (1585,612)-(1615,642)
     probe_roi: Tuple[float, float, float, float] = (0.9600, 0.6591, 0.9782, 0.6915)
+    # 竖屏视频版面：右侧按钮栏整体左移约 213px（实测 x≈1385 vs 1598），收藏星形 ROI 跟着左移
+    probe_roi_portrait: Tuple[float, float, float, float] = (0.8310, 0.6591, 0.8492, 0.6915)
     probe_min_ratio: float = 0.15    # ROI 里亮度 >= 阈值 的像素占比低于此值 → 判定不是普通视频
     menu_y: Dict[str, float] = field(default_factory=lambda: {
         "0.75x": 0.6817,
@@ -126,6 +128,13 @@ class Config:
     back: ActionConfig = field(default_factory=lambda: ActionConfig(method="key", key="esc|alt+left", x=0.5000, y=0.5000))
     favorite: ActionConfig = field(default_factory=lambda: ActionConfig(method="click", x=0.9685, y=0.6753))
     comments: ActionConfig = field(default_factory=lambda: ActionConfig(method="click", x=0.9685, y=0.5922))
+    # 评论抽屉打开后：按钮栏会整体左移 419px，再点原坐标会点进抽屉内容。
+    # 所以关闭走抽屉右上角的 ×（实测能关掉），坐标见 docs/CALIBRATION.md
+    comments_close: ActionConfig = field(default_factory=lambda: ActionConfig(method="click", x=0.9830, y=0.0863))
+    # 竖屏视频版面：按钮栏左移约 199px、下移约 69px。坐标来自单帧实测（blob 像素数与横屏图标一一对应），
+    # y 偏移可能随宽高比变化，所以动作层会先采样目标图标位置确认有图标才点击（见 douyin.py）
+    comments_portrait: ActionConfig = field(default_factory=lambda: ActionConfig(method="click", x=0.8476, y=0.6667))
+    favorite_portrait: ActionConfig = field(default_factory=lambda: ActionConfig(method="click", x=0.8479, y=0.7494))
 
     # ---- 序列化 ----
     def to_dict(self) -> Dict[str, Any]:
@@ -177,6 +186,9 @@ _GROUPS = {
     "back": ActionConfig,
     "favorite": ActionConfig,
     "comments": ActionConfig,
+    "comments_close": ActionConfig,
+    "comments_portrait": ActionConfig,
+    "favorite_portrait": ActionConfig,
 }
 
 

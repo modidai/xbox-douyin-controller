@@ -46,6 +46,11 @@ _CALIBRATED = {
     "like": ("double_click", "", 0.5000, 0.4500),
     "favorite": ("click", "", 0.9685, 0.6753),
     "comments": ("click", "", 0.9685, 0.5922),
+    # 抽屉打开后按钮栏整体左移 419px，只能用抽屉右上角的 × 关；这是实测坐标
+    "comments_close": ("click", "", 0.9830, 0.0863),
+    # 竖屏版面（按钮栏左移 ~199px、整体下移 ~69px）—— 单帧实测，见 docs/CALIBRATION.md §8.13
+    "comments_portrait": ("click", "", 0.8476, 0.6667),
+    "favorite_portrait": ("click", "", 0.8479, 0.7494),
     "back": ("key", "esc|alt+left", 0.5000, 0.5000),
 }
 _PLACEHOLDER = (0.5, 0.5)
@@ -53,6 +58,18 @@ _PLACEHOLDER = (0.5, 0.5)
 # 滚轮安全的落点范围（客户区归一化）：左侧 10% 是导航栏，实测会吞掉滚轮
 _WHEEL_SAFE = (0.10, 0.12, 0.99, 0.96)
 _WHEEL_PARK = (0.5000, 0.4500)
+
+# 竖屏版面"自证采样框"的半宽/半高：取横屏星形 ROI 的一半。
+# 横屏 ROI (0.9600, 0.6591, 0.9782, 0.6915) 宽 0.0182 高 0.0324 → 半宽 0.0091 半高 0.0162，
+# 这样竖屏采到的框与横屏图标框同尺寸，占比阈值可沿用 probe_min_ratio（横屏图标实测约 0.30）。
+_PORTRAIT_PROBE_HALF = (0.0091, 0.0162)
+
+
+def portrait_probe_roi(x, y, half=None):
+    """以图标中心 (x, y) 为中心、与横屏图标框同样大的采样框（归一化 0..1）。"""
+    hw, hh = half or _PORTRAIT_PROBE_HALF
+    return (max(0.0, float(x) - hw), max(0.0, float(y) - hh),
+            min(1.0, float(x) + hw), min(1.0, float(y) + hh))
 
 # 倍速菜单的实测坐标兜底（与 config.py 的 SpeedConfig 默认值一致，配置优先）
 _SPEED_FALLBACK = {
@@ -62,9 +79,11 @@ _SPEED_FALLBACK = {
     "click_interval_ms": 60,
     "back_key": "left",
     "back_seconds": 5,
-    # "只有普通视频才点倍速"的守卫参数（实测见 docs/CALIBRATION.md §8.11）
-    "probe_roi": (0.1242, 0.9397, 0.1878, 0.9763),
-    "probe_min_ratio": 0.02,
+    # "只有普通视频才点倍速"的守卫参数（实测见 docs/CALIBRATION.md §8.11 / §8.13）
+    # 横屏版面取右侧收藏星形；竖屏版面按钮栏左移约 213px，取同位 ROI；两者取 max 判断
+    "probe_roi": (0.9600, 0.6591, 0.9782, 0.6915),
+    "probe_roi_portrait": (0.8310, 0.6591, 0.8492, 0.6915),
+    "probe_min_ratio": 0.15,
     "menu_y": {
         "0.75x": 0.6817,
         "1x": 0.7195,
@@ -160,6 +179,12 @@ class DouyinActions(object):
         # 擅自假设成 1x 会让 set_speed("1x") 零注入还返回 True —— 那是误报成功，
         # 用户会一直卡在别人设的 2x 上（真机复现过）。
         self._speed_label = None
+        # 评论抽屉是否打开（只记"本进程点出来的状态"）。换视频/返回等外部事件会把它复位，
+        # 避免"抽屉早被关掉了但记忆里还开着"导致下一次按 X 只点 × 没反应。
+        self._comments_open = False
+        # 版面记忆："landscape" | "portrait" | "unknown"。只在确实测到版面时更新，切视频复位。
+        # 竖屏下评论/收藏必须"先采样自证图标在，再点"，测不到版面时绝不盲点竖屏坐标。
+        self._layout_hint = "unknown"
         self._no_click_sequence = False
 
     # ------------------------------------------------------------------ 切视频
@@ -176,9 +201,13 @@ class DouyinActions(object):
             method, key_up, key_down, notches = self._swipe_params()
             if method == "key":
                 key = key_up if direction > 0 else key_down
-                return self._press_sequence(key)
-            count = max(1, abs(int(notches)))
-            return self._wheel(direction * count)
+                ok = self._press_sequence(key)
+            else:
+                count = max(1, abs(int(notches)))
+                ok = self._wheel(direction * count)
+            if ok:
+                self._reset_comments_state("切换视频")
+            return ok
         except Exception as exc:  # 动作层绝不把异常抛给调用方
             log.warning("切视频失败(%s): %s", "上一条" if direction > 0 else "下一条", exc)
             return False
@@ -236,13 +265,45 @@ class DouyinActions(object):
 
     # ------------------------------------------------------------------ 收藏
     def favorite(self):
-        """点右侧「收藏」五角星。"""
-        return self._run_action("favorite", "收藏")
+        """点右侧「收藏」五角星；竖屏版面走"先采样自证再点"的坐标。"""
+        try:
+            if self._is_portrait():
+                method, key, x, y = self._action_params("favorite_portrait")
+                if method != "click":
+                    return self._run_action("favorite_portrait", "竖屏收藏")
+                return self._portrait_click((x, y), "竖屏收藏")
+            return self._run_action("favorite", "收藏")
+        except Exception as exc:
+            log.warning("收藏失败: %s", exc)
+            return False
 
     # ------------------------------------------------------------------ 评论
     def open_comments(self):
-        """点右侧「评论」气泡。"""
-        return self._run_action("comments", "打开评论")
+        """评论开关：没开就点右侧评论气泡打开；已经开着就点抽屉右上角 × 关掉。
+
+        为什么要两套坐标：抽屉打开后右侧按钮栏整体左移 419px（实测 0.9685 → 0.7145），
+        再用打开坐标点击会点进抽屉内容里。关闭坐标走 cfg.comments_close，
+        并且同样经过 _run_action 分发 —— 所以配置里把它改成 method="key"（例如 esc）也支持。
+
+        状态语义：True 表示"点击已发出"；点击失败/注入异常时状态保持不变并返回 False。
+        """
+        try:
+            if self._is_portrait():
+                return self._comments_portrait()
+            if self._comments_open:
+                ok = self._run_action("comments_close", "关闭评论")
+                if ok:
+                    self._comments_open = False
+                    log.debug("评论抽屉已关闭（点抽屉右上角 ×）")
+                return ok
+            ok = self._run_action("comments", "打开评论")
+            if ok:
+                self._comments_open = True
+                log.debug("评论抽屉已打开（点右侧评论气泡）")
+            return ok
+        except Exception as exc:
+            log.warning("评论开关失败: %s", exc)
+            return False
 
     # ------------------------------------------------------------------ 返回
     def back(self):
@@ -250,10 +311,14 @@ class DouyinActions(object):
         try:
             method, key, x, y = self._action_params("back")
             if method == "click":
-                return self._click_at(x, y, "back")
-            if method == "double_click":
-                return self._double_click_at(x, y)
-            return self._press_sequence(key or "esc")
+                ok = self._click_at(x, y, "back")
+            elif method == "double_click":
+                ok = self._double_click_at(x, y)
+            else:
+                ok = self._press_sequence(key or "esc")
+            if ok:
+                self._reset_comments_state("返回")
+            return ok
         except Exception as exc:
             log.warning("返回失败: %s", exc)
             return False
@@ -318,45 +383,161 @@ class DouyinActions(object):
             log.warning("切换倍速失败(%s): %s", label, exc)
             return False
 
+    def _layout_ratio(self):
+        """采样横屏/竖屏两处 ROI，判断"是不是普通视频"以及是哪种版面。
+
+        返回 dict：
+          supported  bool          注入器是否有 sample_bright_ratio
+          landscape  float|None    横屏版面 ROI（右侧收藏星形）的亮像素占比
+          portrait   float|None    竖屏版面 ROI（按钮栏左移约 213px 后的同位）的亮像素占比
+          ratio      float|None    两者取 max（可用于判定的那个数）
+          min_ratio  float         配置阈值
+          layout     str           "landscape" | "portrait" | "unknown"
+
+        版面判定规则（宁可保守，不猜坐标）：
+          * 只有横屏 ROI 命中 → landscape
+          * 只有竖屏 ROI 命中 → portrait
+          * 两个都命中 → landscape（宽屏才是已校准坐标的版面）
+          * 都不命中 / 都拿不到 → unknown
+        """
+        info = {"supported": False, "landscape": None, "portrait": None,
+                "ratio": None, "min_ratio": 0.0, "layout": "unknown"}
+        sampler = getattr(self.injector, "sample_bright_ratio", None)
+        if not callable(sampler):
+            return info
+        info["supported"] = True
+        speed = self._speed_cfg()
+        try:
+            info["min_ratio"] = float(speed.get("probe_min_ratio") or 0.0)
+        except (TypeError, ValueError):
+            info["min_ratio"] = 0.0
+        for key in ("landscape", "portrait"):
+            roi = speed.get("probe_roi" if key == "landscape" else "probe_roi_portrait")
+            if roi is None:
+                continue
+            try:
+                value = sampler(tuple(roi))
+            except Exception as exc:
+                log.info("亮度采样异常（%s），该 ROI 视为未知", exc)
+                continue
+            if value is None:
+                continue
+            try:
+                info[key] = float(value)
+            except (TypeError, ValueError):
+                continue
+        land = info["landscape"]
+        port = info["portrait"]
+        values = [v for v in (land, port) if v is not None]
+        if values:
+            info["ratio"] = max(values)
+        if land is not None and land >= info["min_ratio"]:
+            info["layout"] = "landscape"
+        elif port is not None and port >= info["min_ratio"]:
+            info["layout"] = "portrait"
+        if info["layout"] != "unknown":
+            # 只有"确实测到版面"时才写记忆；测不到（None/都低）不覆盖，避免一次采样失败就忘掉竖屏
+            self._layout_hint = info["layout"]
+        return info
+
+    @staticmethod
+    def _fmt_ratio(value):
+        return "None" if value is None else "%.4f" % value
+
     def _video_only_ok(self, target_label):
         """倍速守卫：只在"普通视频"上动手，直播房间/无播放器时一个点击都不发。
 
-        判据来自 Injector.sample_bright_ratio(roi)（客户区某区域的亮像素占比）。
+        判据来自 Injector.sample_bright_ratio(roi)，横屏/竖屏两处 ROI 取 max
+        （竖屏版面按钮栏左移，只看横屏 ROI 会把竖屏视频误判成直播）。
         **行为是不对称的**（宁可功能可用，也不能误点直播间）：
           * 注入器没有采样能力（老版本）→ 跳过守卫，照常执行（debug 日志）
-          * 采样返回 None（窗口找不到/采样失败）→ 视为"未知"，照常执行（info 日志）
-          * 采样返回数值但低于阈值 → 判定不是普通视频，**阻断**（warning 日志）
+          * 两处都拿不到（None / 采样失败）→ 视为"未知"，照常执行（info 日志）
+          * 有数值但 max 低于阈值 → 判定不是普通视频，**阻断**（warning 日志）
+        """
+        info = self._layout_ratio()
+        if not info["supported"]:
+            log.debug("注入器没有 sample_bright_ratio，跳过“只在普通视频上生效”的守卫（向后兼容）")
+            return True
+        ratio = info["ratio"]
+        min_ratio = info["min_ratio"]
+        if ratio is None:
+            log.info("亮度采样不可用（横屏/竖屏都是 None），无法判断是不是普通视频，照常执行倍速 %s",
+                     target_label)
+            return True
+        if ratio < min_ratio:
+            log.warning("疑似直播房间/没有播放器（横屏 %s / 竖屏 %s，最大值 %.4f < 阈值 %.4f），"
+                        "跳过倍速 %s：不发送任何点击",
+                        self._fmt_ratio(info["landscape"]), self._fmt_ratio(info["portrait"]),
+                        ratio, min_ratio, target_label)
+            return False
+        log.debug("亮像素占比 %.4f >= 阈值 %.4f（版面=%s），判定为普通视频，执行倍速 %s",
+                  ratio, min_ratio, info["layout"], target_label)
+        return True
+
+    def _is_portrait(self):
+        """当前是不是竖屏版面（会真采样一次双 ROI）。
+
+        版面测不出来（两个 ROI 都 None）时回落到上一次确实测到的版面记忆，
+        这样"采样偶发失败"不会被当成横屏而盲点错误的坐标。
+        """
+        info = self._layout_ratio()
+        if info["layout"] == "portrait":
+            return True
+        return info["layout"] == "unknown" and self._layout_hint == "portrait"
+
+    def _portrait_click(self, point, what):
+        """竖屏版面：先采样自证"图标确实在这个点上"，再点；证不出来就零点击返回 False。
+
+        **不对称策略（与倍速守卫相反）**：竖屏是没有历史把握的版面，
+        采样不可用时绝不盲点 —— 竖屏坐标点歪了会落进视频画面（= 播放/暂停），
+        那比"诚实地没反应"更糟。
         """
         sampler = getattr(self.injector, "sample_bright_ratio", None)
         if not callable(sampler):
-            log.debug("注入器没有 sample_bright_ratio，跳过“只在普通视频上生效”的守卫（向后兼容）")
-            return True
-        speed = self._speed_cfg()
-        roi = speed.get("probe_roi")
-        min_ratio = speed.get("probe_min_ratio")
-        if roi is None or min_ratio is None:
-            log.debug("配置缺 probe_roi/probe_min_ratio，跳过倍速守卫")
-            return True
+            log.warning("竖屏版面：注入器没有采样能力，无法自证图标位置，"
+                        "竖屏坐标不予盲点，已跳过（%s）", what)
+            return False
+        roi = portrait_probe_roi(point[0], point[1])
         try:
-            ratio = sampler(tuple(roi))
+            ratio = sampler(roi)
         except Exception as exc:
-            log.info("亮度采样异常（%s），无法判断是不是普通视频，照常执行", exc)
-            return True
+            log.warning("竖屏版面：图标自证采样异常（%s），已跳过（%s）", exc, what)
+            return False
+        min_ratio = self._speed_cfg().get("probe_min_ratio") or 0.0
         if ratio is None:
-            log.info("亮度采样不可用（返回 None），无法判断是不是普通视频，照常执行倍速 %s", target_label)
-            return True
+            log.warning("竖屏版面：图标自证采样不可用（None），竖屏坐标未对齐，已跳过（%s）", what)
+            return False
         try:
             ratio = float(ratio)
         except (TypeError, ValueError):
-            log.info("亮度采样返回值异常（%r），照常执行倍速 %s", ratio, target_label)
-            return True
-        if ratio < min_ratio:
-            log.warning("疑似直播房间/没有播放器（亮像素占比 %.4f < 阈值 %.4f），"
-                        "跳过倍速 %s：不发送任何点击", ratio, min_ratio, target_label)
+            log.warning("竖屏版面：自证采样返回值异常（%r），已跳过（%s）", ratio, what)
             return False
-        log.debug("亮像素占比 %.4f >= 阈值 %.4f，判定为普通视频，执行倍速 %s",
-                  ratio, min_ratio, target_label)
-        return True
+        if ratio < min_ratio:
+            log.warning("竖屏版面：目标点没采到图标（亮像素占比 %.4f < 阈值 %.4f），"
+                        "竖屏坐标未对齐，已跳过（%s）", ratio, min_ratio, what)
+            return False
+        log.debug("竖屏版面：目标点自证通过（%.4f >= %.4f），点击 %s", ratio, min_ratio, what)
+        return self._click_at(point[0], point[1], what)
+
+    def _comments_portrait(self):
+        """竖屏版面下的评论开关。
+
+        打开：走 _portrait_click（先自证再点）。
+        关闭：竖屏抽屉的 × 没有实测坐标 → **不点**，warning 提示按 B 键；
+              状态保持 True（抽屉确实还开着，不撒谎），back() 成功后会自己复位。
+        """
+        if self._comments_open:
+            log.warning("竖屏版面：没有实测的关闭坐标，已跳过关闭评论；"
+                        "请按 B 键（Esc）关闭，关闭后状态记忆会自动复位")
+            return False
+        method, key, x, y = self._action_params("comments_portrait")
+        if method != "click":
+            return self._run_action("comments_portrait", "竖屏打开评论")
+        ok = self._portrait_click((x, y), "竖屏打开评论")
+        if ok:
+            self._comments_open = True
+            log.debug("评论抽屉已打开（竖屏版面，坐标自证通过）")
+        return ok
 
     def _click_pair(self, point_a, point_b, interval_ms):
         """两段连点：优先用 injector.click_sequence（一次调用、中间不挪光标、末尾统一还原）。"""
@@ -379,6 +560,22 @@ class DouyinActions(object):
                   point_a, point_b, interval_ms, restore)
         return True
 
+    # -------------------------------------------------------------- UI 状态记忆
+    def reset_ui_state(self):
+        """清空所有 UI 状态记忆（目前只有"评论抽屉是否打开"）。
+
+        外部事件（用户自己点了 ×、切了页面、快捷键关掉抽屉…）之后调用一次即可对齐，
+        避免"记忆里开着、实际已关"导致下一次按 X 只点了 × 却没反应。
+        """
+        self._reset_comments_state("外部复位")
+
+    def _reset_comments_state(self, reason):
+        if self._comments_open:
+            log.debug("评论抽屉状态记忆复位 -> False（原因：%s）", reason)
+        self._comments_open = False
+        # 换视频会换版面，版面记忆一起清掉
+        self._layout_hint = "unknown"
+
     # ------------------------------------------------------------------ 内部
     def _speed_cfg(self):
         """读 SpeedConfig（配置优先，缺失/类型不对时用实测兜底值）。"""
@@ -397,12 +594,14 @@ class DouyinActions(object):
                 out[name] = int(value)
             except (TypeError, ValueError):
                 pass
-        roi = getattr(speed, "probe_roi", None)
-        if roi is not None:
+        for name in ("probe_roi", "probe_roi_portrait"):
+            roi = getattr(speed, name, None)
+            if roi is None:
+                continue
             try:
                 values = tuple(float(item) for item in roi)
                 if len(values) == 4:
-                    out["probe_roi"] = values
+                    out[name] = values
             except (TypeError, ValueError):
                 pass
         try:

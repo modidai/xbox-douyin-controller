@@ -12,7 +12,7 @@ if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
 from xbox_douyin.config import Config
-from xbox_douyin.douyin import DouyinActions
+from xbox_douyin.douyin import DouyinActions, portrait_probe_roi
 
 RECT = (100, 50, 1651, 928)          # 客户区(左, 上, 宽, 高)
 LIKE_PT = (100 + int(round(0.5 * 1650)), 50 + int(round(0.45 * 927)))
@@ -69,19 +69,24 @@ class FakeInjectorWithSequence(FakeInjector):
 
 
 class FakeInjectorWithSampler(FakeInjectorWithSequence):
-    """带 sample_bright_ratio 的假注入器（倍速守卫用）。"""
+    """带 sample_bright_ratio 的假注入器（倍速守卫 / 版面检测用）。
 
-    def __init__(self, ratio=None, raises=False, **kwargs):
+    by_roi: {roi 四元组(4 位小数): 占比}，没列出的 ROI 回落到 ratio（默认 None = 不可用）。
+    """
+
+    def __init__(self, ratio=None, raises=False, by_roi=None, **kwargs):
         super(FakeInjectorWithSampler, self).__init__(**kwargs)
         self.ratio = ratio
         self.raises = raises
+        self.by_roi = dict(by_roi or {})
         self.sampled = []
 
     def sample_bright_ratio(self, roi, lum_threshold=160):
-        self.sampled.append(tuple(round(float(v), 4) for v in roi))
+        key = tuple(round(float(v), 4) for v in roi)
+        self.sampled.append(key)
         if self.raises:
             raise RuntimeError("采样失败(测试用)")
-        return self.ratio
+        return self.by_roi.get(key, self.ratio)
 
 
 def make_config():
@@ -324,11 +329,12 @@ class DouyinVideoGuardTest(unittest.TestCase):
         self.assertEqual(len(self._clicks(inj)), 1)
         self.assertEqual(actions._speed_label, "2x")
 
-    def test_guard_samples_configured_roi(self):
+    def test_guard_samples_both_rois(self):
         inj = FakeInjectorWithSampler(ratio=self.high_ratio)
         DouyinActions(inj, self.cfg).set_speed("2x")
-        self.assertEqual(inj.sampled,
-                         [tuple(round(float(v), 4) for v in self.cfg.speed.probe_roi)])
+        expected = [tuple(round(float(v), 4) for v in self.cfg.speed.probe_roi),
+                    tuple(round(float(v), 4) for v in self.cfg.speed.probe_roi_portrait)]
+        self.assertEqual(inj.sampled, expected)          # 横屏 + 竖屏两处都采
 
     def test_sampler_exception_does_not_block(self):
         inj = FakeInjectorWithSampler(raises=True)
@@ -352,8 +358,256 @@ class DouyinVideoGuardTest(unittest.TestCase):
         inj = FakeInjectorWithSampler(ratio=self.high_ratio)
         actions = DouyinActions(inj, self.cfg)               # 新实例：记忆未知
         self.assertTrue(actions.set_speed("1x"))
-        self.assertEqual(len(inj.sampled), 1)                # 必须采样 + 真点
+        self.assertEqual(len(inj.sampled), 2)                # 横屏+竖屏都采 + 真点
         self.assertEqual(len([c for c in inj.calls if c[0] == "click_sequence"]), 1)
+
+
+class DouyinCommentsToggleTest(unittest.TestCase):
+    """评论开关：未开 -> 点评论气泡；已开 -> 点抽屉右上角 ×；外部事件复位。"""
+
+    def setUp(self):
+        self.cfg = Config()
+        self.inj = FakeInjector()
+        self.actions = DouyinActions(self.inj, self.cfg)
+        self.cfg_comments = (self.cfg.comments.x, self.cfg.comments.y)
+        self.cfg_close = (self.cfg.comments_close.x, self.cfg.comments_close.y)
+
+    def _clicks(self, injector=None):
+        inj = injector or self.inj
+        return [c for c in inj.calls if c[0] == "click_normalized"]
+
+    def test_toggle_open_close_open(self):
+        self.assertFalse(self.actions._comments_open)
+        # 1) 首次：打开
+        self.assertTrue(self.actions.open_comments())
+        self.assertTrue(self.actions._comments_open)
+        self.assertEqual(self._clicks()[-1][1:3], self.cfg_comments)
+        # 2) 第二次：关掉（点抽屉右上角 ×，而不是又点评论图标）
+        self.assertTrue(self.actions.open_comments())
+        self.assertFalse(self.actions._comments_open)
+        self.assertEqual(self._clicks()[-1][1:3], self.cfg_close)
+        self.assertNotEqual(self._clicks()[-1][1:3], self.cfg_comments)
+        # 3) 第三次：又回到打开坐标
+        self.assertTrue(self.actions.open_comments())
+        self.assertTrue(self.actions._comments_open)
+        self.assertEqual(self._clicks()[-1][1:3], self.cfg_comments)
+        self.assertEqual(len(self._clicks()), 3)
+
+    def test_swipe_resets_comments_state(self):
+        self.assertTrue(self.actions.open_comments())
+        self.assertTrue(self.actions._comments_open)
+        self.assertTrue(self.actions.swipe_down())
+        self.assertFalse(self.actions._comments_open)
+
+    def test_swipe_up_also_resets(self):
+        self.actions._comments_open = True
+        self.assertTrue(self.actions.swipe_up())
+        self.assertFalse(self.actions._comments_open)
+
+    def test_back_resets_comments_state(self):
+        self.actions._comments_open = True
+        self.assertTrue(self.actions.back())
+        self.assertFalse(self.actions._comments_open)
+
+    def test_failed_swipe_keeps_state(self):
+        broken = FakeInjector(fail_on="wheel")
+        actions = DouyinActions(broken, self.cfg)
+        actions._comments_open = True
+        self.assertFalse(actions.swipe_down())          # 注入失败
+        self.assertTrue(actions._comments_open)         # 状态不能被复位成 False
+
+    def test_failed_click_keeps_state(self):
+        broken = FakeInjector(fail_on="click_normalized")
+        actions = DouyinActions(broken, self.cfg)
+        actions._comments_open = True
+        self.assertFalse(actions.open_comments())
+        self.assertTrue(actions._comments_open)         # 没点成就不算改了状态
+        fresh = DouyinActions(FakeInjector(fail_on="click_normalized"), self.cfg)
+        self.assertFalse(fresh.open_comments())
+        self.assertFalse(fresh._comments_open)          # 打开失败也不要置 True
+
+    def test_close_can_be_configured_as_key(self):
+        self.cfg.comments_close.method = "key"
+        self.cfg.comments_close.key = "esc"
+        inj = FakeInjector()
+        actions = DouyinActions(inj, self.cfg)
+        actions._comments_open = True
+        self.assertTrue(actions.open_comments())
+        self.assertEqual([c for c in inj.calls if c[0] == "press"], [("press", "esc")])
+        self.assertEqual(self._clicks(inj), [])         # 走按键就不该有点击
+        self.assertFalse(actions._comments_open)
+
+    def test_reset_ui_state_reopens_correctly(self):
+        self.assertTrue(self.actions.open_comments())
+        self.actions.reset_ui_state()
+        self.assertFalse(self.actions._comments_open)
+        self.assertTrue(self.actions.open_comments())
+        self.assertEqual(self._clicks()[-1][1:3], self.cfg_comments)
+
+    def test_missing_comments_close_uses_measured_fallback(self):
+        cfg = Config()
+        try:
+            del cfg.comments_close                      # 模拟旧配置没有这个 group
+        except AttributeError:
+            self.skipTest("该配置不可删属性")
+        inj = FakeInjector()
+        actions = DouyinActions(inj, cfg)
+        actions._comments_open = True
+        self.assertTrue(actions.open_comments())
+        self.assertEqual(self._clicks(inj)[-1][1:3], (0.983, 0.0863))
+
+
+class DouyinLayoutGuardTest(unittest.TestCase):
+    """双 ROI 守卫（横屏/竖屏取 max）五态 + 竖屏版面下评论/收藏整条跳过。"""
+
+    def setUp(self):
+        self.cfg = Config()
+        self.min_ratio = float(self.cfg.speed.probe_min_ratio)
+        self.high = max(self.min_ratio * 2.0, self.min_ratio + 0.05)
+        self.low = self.min_ratio / 2.0
+        self.land_key = tuple(round(float(v), 4) for v in self.cfg.speed.probe_roi)
+        self.port_key = tuple(round(float(v), 4) for v in self.cfg.speed.probe_roi_portrait)
+
+    def _fake(self, land=None, port=None, raises=False):
+        by = {}
+        if land is not None:
+            by[self.land_key] = land
+        if port is not None:
+            by[self.port_key] = port
+        return FakeInjectorWithSampler(ratio=None, by_roi=by, raises=raises)
+
+    def _clicks(self, inj):
+        return [c for c in inj.calls if c[0] == "click_sequence"]
+
+    # ---- 五态守卫 ----
+    def test_landscape_high_passes(self):
+        inj = self._fake(land=self.high, port=self.low)
+        self.assertTrue(DouyinActions(inj, self.cfg).set_speed("2x"))
+        self.assertEqual(len(self._clicks(inj)), 1)
+
+    def test_portrait_high_also_passes_speed(self):
+        # 竖屏版面：max 命中 -> 倍速放行（倍速坐标与版面无关）
+        inj = self._fake(land=self.low, port=self.high)
+        actions = DouyinActions(inj, self.cfg)
+        self.assertTrue(actions.set_speed("2x"))
+        self.assertEqual(len(self._clicks(inj)), 1)
+        self.assertEqual(actions._layout_ratio()["layout"], "portrait")
+
+    def test_both_low_blocks(self):
+        inj = self._fake(land=self.low, port=self.low)
+        with self.assertLogs("xbox_douyin.douyin", level="WARNING") as logs:
+            self.assertFalse(DouyinActions(inj, self.cfg).set_speed("2x"))
+        self.assertEqual(inj.calls, [])
+        self.assertTrue(any("疑似直播房间" in line for line in logs.output))
+
+    def test_one_none_one_high_passes(self):
+        inj = self._fake(land=None, port=self.high)
+        self.assertTrue(DouyinActions(inj, self.cfg).set_speed("2x"))
+        self.assertEqual(len(self._clicks(inj)), 1)
+
+    def test_both_none_passes_as_unknown(self):
+        inj = self._fake()
+        with self.assertLogs("xbox_douyin.douyin", level="INFO") as logs:
+            self.assertTrue(DouyinActions(inj, self.cfg).set_speed("2x"))
+        self.assertEqual(len(self._clicks(inj)), 1)
+        self.assertTrue(any("不可用" in line for line in logs.output))
+
+    # ---- 竖屏版面：评论/收藏整条跳过 ----
+    # ---- 竖屏：先采样自证图标，再点 ----
+    def _portrait_fake(self, comments_ratio=None, favorite_ratio=None):
+        by = {self.land_key: self.low, self.port_key: self.high}
+        if comments_ratio is not None:
+            px, py = self.cfg.comments_portrait.x, self.cfg.comments_portrait.y
+            by[tuple(round(float(v), 4) for v in portrait_probe_roi(px, py))] = comments_ratio
+        if favorite_ratio is not None:
+            fx, fy = self.cfg.favorite_portrait.x, self.cfg.favorite_portrait.y
+            by[tuple(round(float(v), 4) for v in portrait_probe_roi(fx, fy))] = favorite_ratio
+        return FakeInjectorWithSampler(ratio=None, by_roi=by)
+
+    def _norm_clicks(self, inj):
+        """click_normalized 调用（父类的 _clicks 是 click_sequence，别覆盖）。"""
+        return [c for c in inj.calls if c[0] == "click_normalized"]
+
+    def test_portrait_proven_click_uses_portrait_coords(self):
+        inj = self._portrait_fake(comments_ratio=self.high)
+        actions = DouyinActions(inj, self.cfg)
+        self.assertTrue(actions.open_comments())
+        clicks = self._norm_clicks(inj)
+        self.assertEqual(len(clicks), 1)
+        self.assertEqual(clicks[0][1:3], (round(float(self.cfg.comments_portrait.x), 4),
+                                          round(float(self.cfg.comments_portrait.y), 4)))
+        self.assertNotEqual(clicks[0][1:3], (round(float(self.cfg.comments.x), 4),
+                                             round(float(self.cfg.comments.y), 4)))
+        self.assertTrue(actions._comments_open)
+        # 自证用的采样框 = 以竖屏图标中心为中心、横屏图标框同样大小
+        px, py = self.cfg.comments_portrait.x, self.cfg.comments_portrait.y
+        expected = tuple(round(float(v), 4) for v in portrait_probe_roi(px, py))
+        self.assertIn(expected, inj.sampled)
+
+    def test_portrait_proven_favorite_uses_portrait_coords(self):
+        inj = self._portrait_fake(favorite_ratio=self.high)
+        self.assertTrue(DouyinActions(inj, self.cfg).favorite())
+        clicks = self._norm_clicks(inj)
+        self.assertEqual(clicks[0][1:3], (round(float(self.cfg.favorite_portrait.x), 4),
+                                          round(float(self.cfg.favorite_portrait.y), 4)))
+
+    def test_portrait_unproven_click_is_skipped(self):
+        inj = self._portrait_fake(comments_ratio=self.low, favorite_ratio=self.low)
+        actions = DouyinActions(inj, self.cfg)
+        with self.assertLogs("xbox_douyin.douyin", level="WARNING") as logs:
+            self.assertFalse(actions.open_comments())
+            self.assertFalse(actions.favorite())
+        self.assertEqual(self._norm_clicks(inj), [])       # 零点击
+        self.assertFalse(actions._comments_open)
+        self.assertTrue(any("未对齐" in line for line in logs.output))
+
+    def test_portrait_without_sampler_never_clicks(self):
+        # 老注入器判不出版面时不会进竖屏分支；这里模拟"已知竖屏但采样能力没了"
+        inj = FakeInjectorWithSequence()                   # 没有 sample_bright_ratio
+        actions = DouyinActions(inj, self.cfg)
+        actions._layout_hint = "portrait"
+        with self.assertLogs("xbox_douyin.douyin", level="WARNING") as logs:
+            self.assertFalse(actions.open_comments())
+            self.assertFalse(actions.favorite())
+        self.assertEqual(self._norm_clicks(inj), [])
+        self.assertTrue(any("没有采样能力" in line for line in logs.output))
+
+    def test_portrait_close_skipped_with_back_hint(self):
+        inj = self._portrait_fake(comments_ratio=self.high)
+        actions = DouyinActions(inj, self.cfg)
+        actions._comments_open = True
+        with self.assertLogs("xbox_douyin.douyin", level="WARNING") as logs:
+            self.assertFalse(actions.open_comments())
+        self.assertEqual(self._norm_clicks(inj), [])       # 竖屏关闭：不点
+        self.assertTrue(actions._comments_open)            # 状态不撒谎（抽屉确实还开着）
+        self.assertTrue(any("请按 B 键" in line for line in logs.output))
+        # 按 B（back）之后自动复位
+        actions.back()
+        self.assertFalse(actions._comments_open)
+
+    def test_landscape_regression_open_close_and_favorite(self):
+        # 横屏行为必须一条不变：开 -> 评论坐标；再按 -> × 坐标；收藏 -> 横屏收藏坐标
+        inj = self._fake(land=self.high, port=self.low)
+        actions = DouyinActions(inj, self.cfg)
+        self.assertTrue(actions.open_comments())
+        self.assertEqual(self._norm_clicks(inj)[-1][1:3], (round(float(self.cfg.comments.x), 4),
+                                                          round(float(self.cfg.comments.y), 4)))
+        self.assertTrue(actions.open_comments())
+        self.assertEqual(self._norm_clicks(inj)[-1][1:3], (round(float(self.cfg.comments_close.x), 4),
+                                                          round(float(self.cfg.comments_close.y), 4)))
+        self.assertFalse(actions._comments_open)
+        self.assertTrue(actions.favorite())
+        self.assertEqual(self._norm_clicks(inj)[-1][1:3], (round(float(self.cfg.favorite.x), 4),
+                                                          round(float(self.cfg.favorite.y), 4)))
+        self.assertEqual(len(self._norm_clicks(inj)), 3)
+
+    def test_no_sampler_keeps_backward_compatibility(self):
+        # 老注入器：连版面都判不了 -> 评论/收藏照旧执行
+        inj = FakeInjectorWithSequence()
+        actions = DouyinActions(inj, self.cfg)
+        self.assertTrue(actions.open_comments())
+        self.assertTrue(actions.favorite())
+        self.assertEqual(len([c for c in inj.calls if c[0] == "click_normalized"]), 2)
 
 
 if __name__ == "__main__":

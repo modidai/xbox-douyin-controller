@@ -1093,6 +1093,191 @@ def test_grab_roi_releases_gdi_handles():
     )
 
 
+class _FakeKernel32(object):
+    """桩 kernel32：按脚本返回 (handle, last_error)。"""
+
+    def __init__(self, results):
+        self.results = list(results)
+        self.created = []
+        self.closed = []
+        self.raises = False
+        self._error = 0
+
+    def CreateMutexW(self, attrs, initial, name):
+        if self.raises:
+            raise RuntimeError("模拟 CreateMutexW 失败")
+        self.created.append(name)
+        if self.results:
+            handle, error = self.results.pop(0)
+        else:
+            handle, error = (None, 0)
+        self._error = error
+        return handle
+
+    def GetLastError(self):
+        return self._error
+
+    def CloseHandle(self, handle):
+        self.closed.append(handle)
+        return 1
+
+
+def _with_fake_kernel32(fake, func):
+    import run as run_module
+
+    original_kernel = run_module._kernel32
+    original_handle = run_module._SINGLETON_HANDLE
+    original_blocked = run_module._SINGLETON_BLOCKED_BY
+    run_module._kernel32 = fake
+    run_module._SINGLETON_HANDLE = None
+    run_module._SINGLETON_BLOCKED_BY = None
+    try:
+        return func(run_module)
+    finally:
+        run_module._kernel32 = original_kernel
+        run_module._SINGLETON_HANDLE = original_handle
+        run_module._SINGLETON_BLOCKED_BY = original_blocked
+
+
+def test_singleton_acquire():
+    import run as run_module
+
+    fake = _FakeKernel32([(0x1234, 0)])
+    first = _with_fake_kernel32(fake, lambda module: module.acquire_singleton())
+    check("单实例：第一次抢到互斥体返回 True", first is True, first)
+    check("单实例：优先用 Global 前缀", fake.created and fake.created[0].startswith("Global\\"), fake.created)
+    check("单实例：抢到时不关闭句柄", fake.closed == [], fake.closed)
+
+    already = _FakeKernel32([(0x5678, 183)])
+    second = _with_fake_kernel32(already, lambda module: module.acquire_singleton())
+    check("单实例：ERROR_ALREADY_EXISTS 时返回 False", second is False, second)
+    check("单实例：已有实例时把自己的句柄关掉", already.closed == [0x5678], already.closed)
+
+    fallback = _FakeKernel32([(None, 0), (0x9ABC, 0)])
+    third = _with_fake_kernel32(fallback, lambda module: module.acquire_singleton())
+    check("单实例：Global 建不出来时退回普通名字并成功", third is True, third)
+    check(
+        "单实例：确实先试 Global 再试普通名",
+        len(fallback.created) == 2 and fallback.created[0].startswith("Global\\") and not fallback.created[1].startswith("Global\\"),
+        fallback.created,
+    )
+
+    broken = _FakeKernel32([(None, 0), (None, 0)])
+    fourth = _with_fake_kernel32(broken, lambda module: module.acquire_singleton())
+    check("单实例：两个名字都建不出来时放行（不阻断启动）", fourth is True, fourth)
+
+    raising = _FakeKernel32([])
+    raising.raises = True
+    fifth = None
+    try:
+        fifth = _with_fake_kernel32(raising, lambda module: module.acquire_singleton())
+        raised = False
+    except Exception:
+        raised = True
+    check("单实例：CreateMutexW 抛异常也不外传", raised is False, raised)
+    check("单实例：异常路径同样放行", fifth is True, fifth)
+
+    check("单实例：互斥体名字符合约定", run_module.SINGLETON_NAME == "xbox-douyin-controller-singleton", run_module.SINGLETON_NAME)
+
+
+def test_main_exits_when_singleton_taken():
+    import contextlib
+    import io
+
+    import run as run_module
+
+    calls = {"injector": 0, "build": 0, "app": 0, "run": 0}
+
+    def _boom_injector(*args, **kwargs):
+        calls["injector"] += 1
+        raise AssertionError("已有实例时不该创建 Injector")
+
+    def _boom_build(*args, **kwargs):
+        calls["build"] += 1
+        raise AssertionError("已有实例时不该装配动作")
+
+    class _BoomApp(object):
+        def __init__(self, *args, **kwargs):
+            calls["app"] += 1
+            raise AssertionError("已有实例时不该创建 App")
+
+        def run(self):
+            calls["run"] += 1
+            return 0
+
+    originals = (run_module.acquire_singleton, run_module.Injector, run_module.build_actions, run_module.App)
+    run_module.acquire_singleton = lambda *args, **kwargs: False
+    run_module.Injector = _boom_injector
+    run_module.build_actions = _boom_build
+    run_module.App = _BoomApp
+    buffer = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(buffer):
+            code = run_module.main(["--dry-run"])
+    finally:
+        (
+            run_module.acquire_singleton,
+            run_module.Injector,
+            run_module.build_actions,
+            run_module.App,
+        ) = originals
+    text = buffer.getvalue()
+    check("单实例：已有实例时退出码是 0", code == 0, code)
+    check("单实例：不创建 App、不轮询", calls["app"] == 0 and calls["run"] == 0, calls)
+    check("单实例：不创建 Injector、不装配动作", calls["injector"] == 0 and calls["build"] == 0, calls)
+    check("单实例：打印了明确提示", "已经有一个实例在运行了" in text, text)
+    check("单实例：提示里说明为什么退出", "避免重复注入" in text, text)
+
+
+def test_log_file_option():
+    import contextlib
+    import io
+    import os as os_module
+    import tempfile
+
+    import run as run_module
+
+    original_output = run_module._output
+    handle, path = tempfile.mkstemp(suffix="-run-log.txt")
+    os_module.close(handle)
+    try:
+        os_module.remove(path)
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            code = run_module.main(["--selftest", "--log-file", path])
+        check("日志文件：--selftest + --log-file 退出码 0", code == 0, code)
+        check("日志文件：确实创建了日志文件", os_module.path.isfile(path), path)
+        content = ""
+        if os_module.path.isfile(path):
+            with open(path, "r", encoding="utf-8") as fh:
+                content = fh.read()
+        lines = [line for line in content.splitlines() if line.strip()]
+        check("日志文件：文件里至少有一行", len(lines) >= 1, lines[:3])
+        check("日志文件：抓到自检输出", any("[自检]" in line for line in lines), lines[:3])
+        check("日志文件：stdout 仍然照常输出", "[自检]" in buffer.getvalue())
+        check("日志文件：main 结束后输出出口已还原", run_module._output is original_output, run_module._output)
+
+        bad_path = os_module.path.join(tempfile.gettempdir(), "xdc_no_such_dir_42", "run.log")
+        buffer2 = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(buffer2):
+                code2 = run_module.main(["--selftest", "--log-file", bad_path])
+            crashed = False
+        except Exception:
+            crashed = True
+            code2 = None
+        check("日志文件：路径不可写时不崩", crashed is False, crashed)
+        check("日志文件：路径不可写仍按正常流程退出", code2 == 0, code2)
+        check("日志文件：不可写时有提示", "无法写入日志文件" in buffer2.getvalue(), buffer2.getvalue()[:200])
+    finally:
+        run_module._output = original_output
+        if os_module.path.isfile(path):
+            try:
+                os_module.remove(path)
+            except Exception:
+                pass
+
+
 def main():
     print("=== app 引擎离线测试 ===")
     for func in (
@@ -1133,6 +1318,9 @@ def main():
         test_bright_ratio_statistics,
         test_bright_ratio_invalid_inputs,
         test_grab_roi_releases_gdi_handles,
+        test_singleton_acquire,
+        test_main_exits_when_singleton_taken,
+        test_log_file_option,
     ):
         func()
     print("---")

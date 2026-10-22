@@ -48,6 +48,12 @@
       0.9782,
       0.6915
     ],
+    "probe_roi_portrait": [
+      0.831,
+      0.6591,
+      0.8492,
+      0.6915
+    ],
     "probe_min_ratio": 0.15,
     "menu_y": {
       "0.75x": 0.6817,
@@ -94,5 +100,23 @@
     "key": "",
     "x": 0.9685,
     "y": 0.5922
+  },
+  "comments_close": {
+    "method": "click",
+    "key": "",
+    "x": 0.983,
+    "y": 0.0863
+  },
+  "comments_portrait": {
+    "method": "click",
+    "key": "",
+    "x": 0.8476,
+    "y": 0.6667
+  },
+  "favorite_portrait": {
+    "method": "click",
+    "key": "",
+    "x": 0.8479,
+    "y": 0.7494
   }
 }
